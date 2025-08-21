@@ -50,42 +50,41 @@ class FaceRFIDSystem:
     def __init__(self, window):
         self.window = window
         self.window.title("Sentinel Smart Lock")
-        self.window.attributes("-fullscreen", True)  # Fullscreen mode
-
-        # Colors and styles
-        self.bg_color = "#111"
-        self.text_color = "lime"
-        self.window.configure(bg=self.bg_color)
+        self.window.geometry("480x800")   # vertical window (width x height)
+        self.window.configure(bg="white")
 
         # Fonts
-        title_font = ("Arial", 22, "bold")
-        time_font = ("Arial", 16)
+        title_font = ("Arial", 20, "bold")
+        time_font = ("Arial", 14)
 
         # Title
         self.title_label = tk.Label(window, text="🔒 Sentinel Smart Lock",
-                                    font=title_font, fg="lime", bg=self.bg_color)
+                                    font=title_font, fg="green", bg="white")
         self.title_label.pack(pady=10)
 
         # Time/Date
         self.time_label = tk.Label(window, text="", font=time_font,
-                                   fg="white", bg=self.bg_color)
-        self.time_label.pack()
+                                   fg="black", bg="white")
+        self.time_label.pack(pady=5)
 
         # Camera Preview
-        self.video_label = tk.Label(window, bg="black")
-        self.video_label.pack(pady=20)
+        self.video_label = tk.Label(window, bg="white")
+        self.video_label.pack(pady=20, expand=True)
 
         # New Registration button
+        style = ttk.Style()
+        style.configure("TButton", font=("Arial", 14), padding=10)
+
         self.reg_button = ttk.Button(window, text="➕ New Registration",
-                                     command=self.new_registration)
+                                     command=self.new_registration, style="TButton")
         self.reg_button.pack(pady=20)
 
-        # Quit button (for debugging)
+        # Quit button (optional for debug)
         self.quit_button = ttk.Button(window, text="❌ Exit",
-                                      command=self.on_closing)
+                                      command=self.on_closing, style="TButton")
         self.quit_button.pack(side="bottom", pady=10)
 
-        # Initialize logic
+        # Init logic
         self.font = cv2.FONT_HERSHEY_SIMPLEX
         self.face_features_known_list, self.face_name_known_list = [], []
         self.relay_triggered_time, self.relay_on = 0, False
@@ -104,7 +103,7 @@ class FaceRFIDSystem:
         self.update_frame()
         self.window.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-    # Face DB
+    # --- DB ---
     def get_face_database(self):
         if os.path.exists("data/features_all.csv"):
             csv_rd = pd.read_csv("data/features_all.csv", header=None)
@@ -130,6 +129,7 @@ class FaceRFIDSystem:
             print(f"✅ {name} marked present at {current_time}")
         conn.close()
 
+    # --- Frame Processing ---
     def process_frame(self, frame):
         known_detected = False
         faces = detector(frame, 0)
@@ -143,8 +143,8 @@ class FaceRFIDSystem:
                 known_detected = True
             else:
                 name = "unknown"
-            cv2.rectangle(frame, (face.left(), face.top()), (face.right(), face.bottom()), (0, 255, 0), 2)
-            cv2.putText(frame, name, (face.left(), face.top() - 10), self.font, 0.6, (0, 255, 255), 1)
+            cv2.rectangle(frame, (face.left(), face.top()), (face.right(), face.bottom()), (0, 0, 0), 2)
+            cv2.putText(frame, name, (face.left(), face.top() - 10), self.font, 0.6, (0, 0, 0), 1)
 
         # RFID check
         try:
@@ -155,7 +155,7 @@ class FaceRFIDSystem:
                     rfid_name = self.rfid_tags[id]
                     self.attendance(rfid_name)
                     known_detected = True
-                    cv2.putText(frame, f"RFID: {rfid_name}", (10, 30), self.font, 0.7, (255, 255, 0), 2)
+                    cv2.putText(frame, f"RFID: {rfid_name}", (10, 30), self.font, 0.7, (0, 128, 0), 2)
                     print(f"🔑 RFID authorized: {rfid_name}")
                     self.last_rfid_id, self.last_rfid_time = id, now
         except Exception:
@@ -174,6 +174,7 @@ class FaceRFIDSystem:
 
         return frame
 
+    # --- GUI Updates ---
     def update_time(self):
         now = datetime.datetime.now().strftime("%I:%M %p | %b %d, %Y")
         self.time_label.config(text=now)
@@ -184,7 +185,7 @@ class FaceRFIDSystem:
         if ret:
             frame = self.process_frame(frame)
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame = cv2.rotate(frame, cv2.ROTATE_180)  # Flip to correct orientation
+            frame = cv2.rotate(frame, cv2.ROTATE_180)  # rotate if display upside down
             img = Image.fromarray(frame)
             imgtk = ImageTk.PhotoImage(image=img)
             self.video_label.imgtk = imgtk
@@ -193,7 +194,7 @@ class FaceRFIDSystem:
 
     def new_registration(self):
         print("👉 New Registration pressed")
-        # Later → call os.system("python3 register.py")
+        # later -> os.system("python3 register.py")
 
     def on_closing(self):
         self.cap.release()
