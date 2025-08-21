@@ -1,21 +1,208 @@
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Sentinel Smart Lock</title>
-    <style>
-        body { text-align: center; font-family: Arial; background: #f8f9fa; }
-        h1 { color: #2e7d32; }
-        .btn { padding: 10px 20px; background: green; color: white; text-decoration: none; border-radius: 8px; }
-        .btn:hover { background: darkgreen; }
-        .status { margin-top: 20px; color: green; font-weight: bold; }
-    </style>
-</head>
-<body>
-    <h1>🔒 Sentinel Smart Lock</h1>
-    <p><b>Camera Feed</b></p>
-    <img src="{{ url_for('video_feed') }}" width="320" height="240">
-    <br><br>
-    <a href="{{ url_for('register') }}" class="btn">New Registration</a>
-    <div class="status">{{ status }}</div>
-</body>
-</html>
+import sys
+import os
+sys.path.insert(0, os.path.abspath("/home/project/Desktop/Att/lib"))
+
+import dlib
+import numpy as np
+import cv2
+import pandas as pd
+import time
+import sqlite3
+import datetime
+import RPi.GPIO as GPIO
+from mfrc522 import SimpleMFRC522
+import tkinter as tk
+from PIL import Image, ImageTk
+
+# --- Setup Dlib Models ---
+detector = dlib.get_frontal_face_detector()
+predictor = dlib.shape_predictor('data/data_dlib/shape_predictor_68_face_landmarks.dat')
+face_reco_model = dlib.face_recognition_model_v1("data/data_dlib/dlib_face_recognition_resnet_model_v1.dat")
+
+# --- Relay GPIO setup ---
+RELAY_GPIO = 11
+RELAY_ON = GPIO.HIGH
+RELAY_OFF = GPIO.LOW
+
+GPIO.setmode(GPIO.BOARD)
+GPIO.setup(RELAY_GPIO, GPIO.OUT)
+GPIO.output(RELAY_GPIO, RELAY_OFF)
+
+# --- RFID setup ---
+reader = SimpleMFRC522()
+
+# --- Attendance database ---
+conn = sqlite3.connect("attendance.db")
+cursor = conn.cursor()
+cursor.execute("CREATE TABLE IF NOT EXISTS attendance (name TEXT, time TEXT, date DATE, UNIQUE(name, date))")
+conn.commit()
+conn.close()
+
+# --- Load RFID users ---
+def load_registered_rfid_tags():
+    tags = {}
+    conn = sqlite3.connect("rfid_tags.db")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE IF NOT EXISTS rfid_users (id INTEGER PRIMARY KEY AUTOINCREMENT, rfid_id INTEGER UNIQUE, name TEXT)")
+    cursor.execute("SELECT rfid_id, name FROM rfid_users")
+    rows = cursor.fetchall()
+    for rfid_id, name in rows:
+        tags[int(rfid_id)] = name
+    conn.close()
+    return tags
+
+
+class FaceRFIDSystem:
+    def __init__(self, window):
+        self.window = window
+        self.window.title("Sentinel Smart Lock")
+        self.window.geometry("800x480")  # Adjust to screen
+
+        self.font = cv2.FONT_HERSHEY_SIMPLEX
+        self.face_features_known_list = []
+        self.face_name_known_list = []
+        self.relay_triggered_time = 0
+        self.relay_on = False
+        self.rfid_tags = load_registered_rfid_tags()
+
+        # RFID last scanned tracking
+        self.last_rfid_id = None
+        self.last_rfid_time = 0
+        self.rfid_cooldown = 5  # seconds
+
+        # Camera
+        self.cap = cv2.VideoCapture(0)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+
+        if not self.get_face_database():
+            print("❌ Face database not found.")
+            exit()
+
+        # Tkinter canvas
+        self.canvas = tk.Canvas(self.window, width=800, height=480, bg="black")
+        self.canvas.pack(fill="both", expand=True)
+
+        # New Registration button
+        self.reg_button = tk.Button(window, text="➕ New Registration",
+                                    font=("Arial", 16), bg="green", fg="white",
+                                    command=self.new_registration)
+
+        self.update_time()
+        self.update_frame()
+
+        self.window.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def get_face_database(self):
+        if os.path.exists("data/features_all.csv"):
+            csv_rd = pd.read_csv("data/features_all.csv", header=None)
+            for i in range(csv_rd.shape[0]):
+                features = [csv_rd.iloc[i][j] for j in range(1, 129)]
+                self.face_name_known_list.append(csv_rd.iloc[i][0])
+                self.face_features_known_list.append(features)
+            return True
+        return False
+
+    def euclidean_distance(self, f1, f2):
+        return np.linalg.norm(np.array(f1) - np.array(f2))
+
+    def attendance(self, name):
+        current_date = datetime.datetime.now().strftime('%Y-%m-%d')
+        conn = sqlite3.connect("attendance.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM attendance WHERE name = ? AND date = ?", (name, current_date))
+        if not cursor.fetchone():
+            current_time = datetime.datetime.now().strftime('%H:%M:%S')
+            cursor.execute("INSERT INTO attendance (name, time, date) VALUES (?, ?, ?)", (name, current_time, current_date))
+            conn.commit()
+            print(f"✅ {name} marked present at {current_time}")
+        conn.close()
+
+    def process_frame(self, frame):
+        known_detected = False
+        faces = detector(frame, 0)
+        for face in faces:
+            shape = predictor(frame, face)
+            face_feature = face_reco_model.compute_face_descriptor(frame, shape)
+            distances = [self.euclidean_distance(face_feature, f) for f in self.face_features_known_list]
+            if distances and min(distances) < 0.6:
+                name = self.face_name_known_list[distances.index(min(distances))]
+                self.attendance(name)
+                known_detected = True
+            else:
+                name = "unknown"
+            cv2.rectangle(frame, (face.left(), face.top()), (face.right(), face.bottom()), (255, 255, 255), 2)
+            cv2.putText(frame, name, (face.left(), face.top() - 10), self.font, 0.6, (0, 255, 255), 1)
+
+        # RFID check
+        try:
+            id, text = reader.read_no_block()
+            now = time.time()
+            if id and id in self.rfid_tags:
+                if id != self.last_rfid_id or (now - self.last_rfid_time) > self.rfid_cooldown:
+                    rfid_name = self.rfid_tags[id]
+                    self.attendance(rfid_name)
+                    known_detected = True
+                    cv2.putText(frame, f"RFID: {rfid_name}", (10, 30), self.font, 0.7, (0, 255, 0), 2)
+                    print(f"🔑 RFID authorized: {rfid_name}")
+                    self.last_rfid_id = id
+                    self.last_rfid_time = now
+        except Exception:
+            pass
+
+        # Relay logic
+        now = time.time()
+        if known_detected and not self.relay_on:
+            GPIO.output(RELAY_GPIO, RELAY_ON)
+            self.relay_triggered_time = now
+            self.relay_on = True
+            print("🔓 Relay ON (Access Granted)")
+
+        if self.relay_on and (now - self.relay_triggered_time >= 10):
+            GPIO.output(RELAY_GPIO, RELAY_OFF)
+            self.relay_on = False
+            print("🔒 Relay OFF")
+
+        return frame
+
+    def update_time(self):
+        now = datetime.datetime.now().strftime("%I:%M %p\n%b %d, %Y")
+        self.canvas.delete("time")
+        self.canvas.create_text(750, 240, text=now, font=("Arial", 16), fill="white", angle=90, tags="time")
+        self.canvas.delete("title")
+        self.canvas.create_text(50, 240, text="🔒 Sentinel Smart Lock",
+                                font=("Arial", 20, "bold"), fill="lime", angle=90, tags="title")
+        self.window.after(1000, self.update_time)
+
+    def update_frame(self):
+        ret, frame = self.cap.read()
+        if ret:
+            frame = self.process_frame(frame)
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)  # Rotate preview
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(frame)
+            self.photo = ImageTk.PhotoImage(image=img)
+            self.canvas.delete("camera")
+            self.canvas.create_image(400, 240, image=self.photo, tags="camera")
+
+        # Place button rotated
+        self.canvas.delete("button")
+        self.canvas.create_window(700, 420, window=self.reg_button, tags="button")
+
+        self.window.after(20, self.update_frame)
+
+    def new_registration(self):
+        print("👉 New Registration pressed")
+        # Later link: os.system("python3 register.py")
+
+    def on_closing(self):
+        self.cap.release()
+        cv2.destroyAllWindows()
+        GPIO.cleanup()
+        self.window.destroy()
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = FaceRFIDSystem(root)
+    root.mainloop()
