@@ -131,13 +131,14 @@ class AccessSystem:
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
 
                     with self.state_lock:
-                        if not self.lock_open and time.time() - self.last_close_time >= self.cooldown_seconds:
+                        if (not self.lock_open) and (time.time() - self.last_close_time >= self.cooldown_seconds):
                             GPIO.output(RELAY_GPIO, GPIO.HIGH)
                             self.lock_open = True
                             self.current_user = name
                             self.lock_open_start_time = time.time()
                             print(f"🔓 Lock opened by {name} (Face)")
                             log_access(name, "Face", open_time=now_str)
+                            self.other_faces.clear()  # reset others so detection works fresh
                         elif self.lock_open and name != self.current_user and name not in self.other_faces:
                             print(f"Other face detected: {name} at {now_str}")
                             log_access(name, "Face", open_time=now_str)
@@ -190,13 +191,14 @@ class AccessSystem:
                     if rfid_id in rfid_tags:
                         tag_name = rfid_tags[rfid_id]
                         self.detected_tags.add(tag_name)
-                        if not self.lock_open and time.time() - self.last_close_time >= self.cooldown_seconds:
+                        if (not self.lock_open) and (time.time() - self.last_close_time >= self.cooldown_seconds):
                             GPIO.output(RELAY_GPIO, GPIO.HIGH)
                             self.lock_open = True
                             self.current_user = tag_name
                             self.lock_open_start_time = time.time()
                             print(f"🔓 Lock opened by {tag_name} (RFID)")
                             log_access(tag_name, "RFID", open_time=now_str)
+                            self.other_tags.clear()  # reset others so detection works fresh
                         elif self.lock_open and tag_name != self.current_user and tag_name not in self.other_tags:
                             print(f"Other RFID detected: {tag_name} at {now_str}")
                             log_access(tag_name, "RFID", open_time=now_str)
@@ -221,4 +223,3 @@ if __name__ == "__main__":
     print("🔑 Access System Running...")
     system = AccessSystem()
     system.run()
-
