@@ -75,17 +75,9 @@ class AccessSystem:
         self.lock_open = False
         self.current_user = None
         self.lock_open_start_time = 0
-        self.lock_duration = 15       # Lock stays open 15s
+        self.lock_duration = 10       # Lock stays open 15s
         self.cooldown_seconds = 10    # Wait 10s after closing
         self.last_close_time = 0
-
-        # Track other detections while lock is open
-        self.other_faces = set()
-        self.other_tags = set()
-
-        # Detected faces/tags in current frame
-        self.detected_faces = set()
-        self.detected_tags = set()
 
         # Video capture
         self.cap = cv2.VideoCapture(0)
@@ -114,8 +106,9 @@ class AccessSystem:
                 continue
 
             faces = detector(frame, 0)
-            self.detected_faces.clear()
             now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            detected_names = []
 
             for face in faces:
                 shape = predictor(frame, face)
@@ -124,13 +117,14 @@ class AccessSystem:
 
                 if distances and min(distances) < 0.6:
                     name = self.face_name_known_list[distances.index(min(distances))]
-                    self.detected_faces.add(name)
+                    detected_names.append(name)
 
                     cv2.rectangle(frame, (face.left(), face.top()), (face.right(), face.bottom()), (255, 255, 255), 2)
                     cv2.putText(frame, name, (face.left(), face.top()-10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
 
                     with self.state_lock:
+                        # Open only if closed + cooldown passed
                         if (not self.lock_open) and (time.time() - self.last_close_time >= self.cooldown_seconds):
                             GPIO.output(RELAY_GPIO, GPIO.HIGH)
                             self.lock_open = True
@@ -138,59 +132,55 @@ class AccessSystem:
                             self.lock_open_start_time = time.time()
                             print(f"🔓 Lock opened by {name} (Face)")
                             log_access(name, "Face", open_time=now_str)
-                            self.other_faces.clear()  # reset others so detection works fresh
-                        elif self.lock_open and name != self.current_user and name not in self.other_faces:
-                            print(f"Other face detected: {name} at {now_str}")
+
+                        # If lock already open by another user → just log
+                        elif self.lock_open and name != self.current_user:
                             log_access(name, "Face", open_time=now_str)
-                            self.other_faces.add(name)
+
                 else:
                     # Unknown face → log only
                     cv2.rectangle(frame, (face.left(), face.top()), (face.right(), face.bottom()), (0,0,255),2)
                     cv2.putText(frame, "Unknown", (face.left(), face.top()-10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255),1)
-                    with self.state_lock:
-                        log_access("Unknown", "Face", open_time=now_str)
+                    log_access("Unknown", "Face", open_time=now_str)
+
+            # Automatic lock close after 15s if opener still present
+            with self.state_lock:
+                if self.lock_open and time.time() - self.lock_open_start_time >= self.lock_duration:
+                    if self.current_user in detected_names:
+                        GPIO.output(RELAY_GPIO, GPIO.LOW)
+                        now_close_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        print(f"🔒 Lock closed by {self.current_user}")
+                        log_access(self.current_user, "Face", close_time=now_close_str)
+                        self.lock_open = False
+                        self.current_user = None
+                        self.last_close_time = time.time()
+                    else:
+                        # Reset timer if opener not seen
+                        self.lock_open_start_time = time.time()
 
             cv2.imshow("Access System", frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
-
-            # Automatic lock close after 15s if same user still present
-            with self.state_lock:
-                if self.lock_open and time.time() - self.lock_open_start_time >= self.lock_duration:
-                    if self.current_user in self.detected_faces or self.current_user in self.detected_tags:
-                        GPIO.output(RELAY_GPIO, GPIO.LOW)
-                        now_close_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        print(f"🔒 Lock closed by {self.current_user}")
-                        log_access(self.current_user, "Face" if self.current_user in self.face_name_known_list else "RFID", close_time=now_close_str)
-                        self.lock_open = False
-                        self.current_user = None
-                        self.other_faces.clear()
-                        self.other_tags.clear()
-                        self.last_close_time = time.time()
-                    else:
-                        # User not present → reset timer and continue waiting
-                        self.lock_open_start_time = time.time()
 
             time.sleep(0.05)
 
     # ---------- RFID Processing ----------
     def process_rfid(self):
         while True:
-            rfid_id, text = None, None
             try:
                 rfid_id, text = reader.read_no_block()
             except:
-                print("Error reading RFID!")
+                rfid_id = None
 
             now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self.detected_tags.clear()
 
             if rfid_id:
                 with self.state_lock:
                     if rfid_id in rfid_tags:
                         tag_name = rfid_tags[rfid_id]
-                        self.detected_tags.add(tag_name)
+
+                        # Open only if closed + cooldown passed
                         if (not self.lock_open) and (time.time() - self.last_close_time >= self.cooldown_seconds):
                             GPIO.output(RELAY_GPIO, GPIO.HIGH)
                             self.lock_open = True
@@ -198,15 +188,30 @@ class AccessSystem:
                             self.lock_open_start_time = time.time()
                             print(f"🔓 Lock opened by {tag_name} (RFID)")
                             log_access(tag_name, "RFID", open_time=now_str)
-                            self.other_tags.clear()  # reset others so detection works fresh
-                        elif self.lock_open and tag_name != self.current_user and tag_name not in self.other_tags:
-                            print(f"Other RFID detected: {tag_name} at {now_str}")
+
+                        # If lock already open by another user → just log
+                        elif self.lock_open and tag_name != self.current_user:
                             log_access(tag_name, "RFID", open_time=now_str)
-                            self.other_tags.add(tag_name)
+
                     else:
                         # Unknown RFID → log only
                         print(f"❌ Unknown RFID tag: {rfid_id}")
                         log_access("Unknown", "RFID", open_time=now_str)
+
+            # Automatic close (same logic as face)
+            with self.state_lock:
+                if self.lock_open and time.time() - self.lock_open_start_time >= self.lock_duration:
+                    if self.current_user == rfid_tags.get(rfid_id, None):
+                        GPIO.output(RELAY_GPIO, GPIO.LOW)
+                        now_close_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        print(f"🔒 Lock closed by {self.current_user}")
+                        log_access(self.current_user, "RFID", close_time=now_close_str)
+                        self.lock_open = False
+                        self.current_user = None
+                        self.last_close_time = time.time()
+                    else:
+                        # Reset timer if opener not seen
+                        self.lock_open_start_time = time.time()
 
             time.sleep(0.1)
 
