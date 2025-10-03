@@ -49,7 +49,6 @@ rfid_tags = load_registered_rfid_tags()
 
 # ---------------- CSV Logging ----------------
 csv_lock = Lock()
-
 def log_access(name, access_type, open_time="", close_time=""):
     with csv_lock:
         file_exists = os.path.exists(ACCESS_CSV)
@@ -76,13 +75,17 @@ class AccessSystem:
         self.lock_open = False
         self.current_user = None
         self.lock_open_start_time = 0
-        self.lock_duration = 15       # lock stays open 15s
-        self.cooldown_seconds = 10    # wait 10s after closing
+        self.lock_duration = 15       # Lock stays open 15s
+        self.cooldown_seconds = 10    # Wait 10s after closing
         self.last_close_time = 0
 
-        # Track other detections
+        # Track other detections while lock is open
         self.other_faces = set()
         self.other_tags = set()
+
+        # Detected faces/tags in current frame
+        self.detected_faces = set()
+        self.detected_tags = set()
 
         # Video capture
         self.cap = cv2.VideoCapture(0)
@@ -103,6 +106,7 @@ class AccessSystem:
     def euclidean_distance(self, f1, f2):
         return np.linalg.norm(np.array(f1) - np.array(f2))
 
+    # ---------- Face Processing ----------
     def process_face(self):
         while True:
             ret, frame = self.cap.read()
@@ -110,21 +114,21 @@ class AccessSystem:
                 continue
 
             faces = detector(frame, 0)
-            detected_names = []
+            self.detected_faces.clear()
+            now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
             for face in faces:
                 shape = predictor(frame, face)
                 face_feature = face_reco_model.compute_face_descriptor(frame, shape)
                 distances = [self.euclidean_distance(face_feature, f) for f in self.face_features_known_list]
 
-                now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
                 if distances and min(distances) < 0.6:
                     name = self.face_name_known_list[distances.index(min(distances))]
-                    detected_names.append(name)
+                    self.detected_faces.add(name)
 
                     cv2.rectangle(frame, (face.left(), face.top()), (face.right(), face.bottom()), (255, 255, 255), 2)
-                    cv2.putText(frame, name, (face.left(), face.top() - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+                    cv2.putText(frame, name, (face.left(), face.top()-10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
 
                     with self.state_lock:
                         if not self.lock_open and time.time() - self.last_close_time >= self.cooldown_seconds:
@@ -140,8 +144,9 @@ class AccessSystem:
                             self.other_faces.add(name)
                 else:
                     # Unknown face → log only
-                    cv2.rectangle(frame, (face.left(), face.top()), (face.right(), face.bottom()), (0, 0, 255), 2)
-                    cv2.putText(frame, "Unknown", (face.left(), face.top() - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1)
+                    cv2.rectangle(frame, (face.left(), face.top()), (face.right(), face.bottom()), (0,0,255),2)
+                    cv2.putText(frame, "Unknown", (face.left(), face.top()-10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255),1)
                     with self.state_lock:
                         log_access("Unknown", "Face", open_time=now_str)
 
@@ -149,35 +154,42 @@ class AccessSystem:
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
-            # Automatic lock close
+            # Automatic lock close after 15s if same user still present
             with self.state_lock:
                 if self.lock_open and time.time() - self.lock_open_start_time >= self.lock_duration:
-                    GPIO.output(RELAY_GPIO, GPIO.LOW)
-                    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    print(f"🔒 Lock closed by {self.current_user}")
-                    log_access(self.current_user, "Face" if self.current_user in self.face_name_known_list else "RFID", close_time=now_str)
-                    self.lock_open = False
-                    self.current_user = None
-                    self.other_faces.clear()
-                    self.other_tags.clear()
-                    self.last_close_time = time.time()
+                    if self.current_user in self.detected_faces or self.current_user in self.detected_tags:
+                        GPIO.output(RELAY_GPIO, GPIO.LOW)
+                        now_close_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        print(f"🔒 Lock closed by {self.current_user}")
+                        log_access(self.current_user, "Face" if self.current_user in self.face_name_known_list else "RFID", close_time=now_close_str)
+                        self.lock_open = False
+                        self.current_user = None
+                        self.other_faces.clear()
+                        self.other_tags.clear()
+                        self.last_close_time = time.time()
+                    else:
+                        # User not present → reset timer and continue waiting
+                        self.lock_open_start_time = time.time()
 
             time.sleep(0.05)
 
+    # ---------- RFID Processing ----------
     def process_rfid(self):
         while True:
             rfid_id, text = None, None
             try:
                 rfid_id, text = reader.read_no_block()
             except:
-                print("Error while reading RFID!")
+                print("Error reading RFID!")
 
             now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.detected_tags.clear()
 
             if rfid_id:
                 with self.state_lock:
                     if rfid_id in rfid_tags:
                         tag_name = rfid_tags[rfid_id]
+                        self.detected_tags.add(tag_name)
                         if not self.lock_open and time.time() - self.last_close_time >= self.cooldown_seconds:
                             GPIO.output(RELAY_GPIO, GPIO.HIGH)
                             self.lock_open = True
@@ -196,6 +208,7 @@ class AccessSystem:
 
             time.sleep(0.1)
 
+    # ---------- Run System ----------
     def run(self):
         t1 = Thread(target=self.process_face)
         t2 = Thread(target=self.process_rfid)
@@ -208,3 +221,4 @@ if __name__ == "__main__":
     print("🔑 Access System Running...")
     system = AccessSystem()
     system.run()
+
