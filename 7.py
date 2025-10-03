@@ -23,14 +23,29 @@ GPIO.setmode(GPIO.BOARD)
 GPIO.setup(RELAY_GPIO, GPIO.OUT)
 GPIO.output(RELAY_GPIO, RELAY_OFF)
 
+CSV_FILE = "face_access_log.csv"
+
 # --- CSV logging ---
-def log_entry_csv(name, open_time="", close_time=""):
-    file_exists = os.path.exists("face_access_log.csv")
-    with open("face_access_log.csv", "a", newline="") as f:
+def log_open(name, open_time):
+    # Append a new row for open timestamp
+    file_exists = os.path.exists(CSV_FILE)
+    with open(CSV_FILE, "a", newline="") as f:
         writer = csv.writer(f)
         if not file_exists:
             writer.writerow(["Name", "Open Timestamp", "Close Timestamp"])
-        writer.writerow([name, open_time, close_time])
+        writer.writerow([name, open_time, ""])
+
+def log_close(name, close_time):
+    # Update the last row for this user with close timestamp
+    if not os.path.exists(CSV_FILE):
+        return
+    df = pd.read_csv(CSV_FILE)
+    # Find the last row for this name with empty Close Timestamp
+    mask = (df["Name"] == name) & (df["Close Timestamp"] == "")
+    if mask.any():
+        idx = df[mask].index[-1]
+        df.at[idx, "Close Timestamp"] = close_time
+        df.to_csv(CSV_FILE, index=False)
 
 class FaceAccessSystem:
     def __init__(self):
@@ -41,8 +56,8 @@ class FaceAccessSystem:
         self.lock_open = False
         self.current_user = None
         self.open_time_str = None
-        self.last_close_time = 0         # timestamp when lock was last closed
-        self.cooldown_seconds = 10       # ignore reopening for 10 seconds after closing
+        self.lock_open_start_time = 0
+        self.wait_seconds = 15  # wait 15 sec before closing
 
         self.other_faces = {}  # Track other faces detected while lock is open
 
@@ -75,6 +90,7 @@ class FaceAccessSystem:
                 continue
 
             faces = detector(frame, 0)
+            detected_names = []
 
             for face in faces:
                 shape = predictor(frame, face)
@@ -83,43 +99,50 @@ class FaceAccessSystem:
 
                 if distances and min(distances) < 0.6:
                     name = self.face_name_known_list[distances.index(min(distances))]
+                    detected_names.append(name)
 
                     cv2.rectangle(frame, (face.left(), face.top()), (face.right(), face.bottom()), (255, 255, 255), 2)
                     cv2.putText(frame, name, (face.left(), face.top() - 10), self.font, 0.6, (0, 255, 255), 1)
 
-                    now_time = time.time()
+                    now_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
                     if not self.lock_open:
-                        # Lock closed → open if cooldown passed
-                        if now_time - self.last_close_time >= self.cooldown_seconds:
-                            GPIO.output(RELAY_GPIO, RELAY_ON)
-                            self.lock_open = True
-                            self.current_user = name
-                            self.open_time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            print(f"🔓 Lock opened by {name}")
-                            log_entry_csv(name, open_time=self.open_time_str)
-                    elif self.lock_open and name == self.current_user:
-                        # Same person detected → close lock
-                        GPIO.output(RELAY_GPIO, RELAY_OFF)
-                        self.lock_open = False
-                        close_time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        print(f"🔒 Lock closed by {name}")
-                        log_entry_csv(name, open_time=self.open_time_str, close_time=close_time_str)
-                        self.current_user = None
-                        self.open_time_str = None
-                        self.other_faces.clear()
-                        self.last_close_time = time.time()
+                        # Open lock for this person
+                        GPIO.output(RELAY_GPIO, RELAY_ON)
+                        self.lock_open = True
+                        self.current_user = name
+                        self.open_time_str = now_time
+                        self.lock_open_start_time = time.time()
+                        print(f"🔓 Lock opened by {name}")
+                        log_open(name, self.open_time_str)
                     else:
-                        # Lock open, other faces → log only entry if first time
-                        if name not in self.other_faces:
-                            entry_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            print(f"Other detected: {name} at {entry_time}")
-                            log_entry_csv(name, open_time=entry_time)
-                            self.other_faces[name] = entry_time
+                        # Lock open, other faces → log only first time
+                        if name != self.current_user and name not in self.other_faces:
+                            print(f"Other detected: {name} at {now_time}")
+                            log_open(name, now_time)
+                            self.other_faces[name] = now_time
                 else:
                     # Unknown face
                     cv2.rectangle(frame, (face.left(), face.top()), (face.right(), face.bottom()), (0, 0, 255), 2)
                     cv2.putText(frame, "Unknown", (face.left(), face.top() - 10), self.font, 0.6, (0, 0, 255), 1)
+
+            # Automatic close after wait_seconds if current user still present
+            if self.lock_open:
+                elapsed = time.time() - self.lock_open_start_time
+                if elapsed >= self.wait_seconds:
+                    if self.current_user in detected_names:
+                        # Close lock
+                        GPIO.output(RELAY_GPIO, RELAY_OFF)
+                        self.lock_open = False
+                        close_time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        print(f"🔒 Lock closed by {self.current_user}")
+                        log_close(self.current_user, close_time_str)
+                        self.current_user = None
+                        self.open_time_str = None
+                        self.other_faces.clear()
+                    else:
+                        # Same person not present → continue waiting
+                        self.lock_open_start_time = time.time()  # reset timer
 
             cv2.imshow("Face Access System", frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -135,4 +158,3 @@ class FaceAccessSystem:
 if __name__ == "__main__":
     system = FaceAccessSystem()
     system.run()
-
