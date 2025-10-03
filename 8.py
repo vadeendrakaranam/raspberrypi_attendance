@@ -183,6 +183,3 @@ class FaceAccessSystem:
 if __name__ == "__main__":
     system = FaceAccessSystem()
     system.run()
-
-
-
