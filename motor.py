@@ -1,248 +1,151 @@
-import sys, os
-sys.path.insert(0, os.path.abspath("/home/project/Desktop/Att/lib"))
-
-import dlib, cv2, numpy as np, pandas as pd, sqlite3, time, datetime, csv
 import tkinter as tk
-from threading import Thread, Lock
+from PIL import Image, ImageTk
+import threading
+import time
+import datetime
+import csv
+import os
+import cv2
 import RPi.GPIO as GPIO
-from mfrc522 import SimpleMFRC522
 
-# ---------------- GPIO Setup ----------------
-# L298N Motor pins
-ENA, IN1, IN2 = 12, 5, 6   # Motor 1
-ENB, IN3, IN4 = 13, 20, 21 # Motor 2
+# ---------------- GPIO SETUP ----------------
+RELAY_GPIO = 11
+GPIO.setmode(GPIO.BOARD)
+GPIO.setup(RELAY_GPIO, GPIO.OUT)
+GPIO.output(RELAY_GPIO, GPIO.LOW)  # initially off
 
-GPIO.setmode(GPIO.BCM)
-for pin in [ENA, IN1, IN2, ENB, IN3, IN4]:
-    GPIO.setup(pin, GPIO.OUT)
-    GPIO.output(pin, GPIO.LOW)
+# ---------------- GLOBAL STATE ----------------
+auth_state = {"face_verified": False, "rfid_verified": False, "name": None}
 
-pwmA = GPIO.PWM(ENA, 1000)
-pwmB = GPIO.PWM(ENB, 1000)
-pwmA.start(0)
-pwmB.start(0)
+FACE_CSV = "face_access_log.csv"
+RFID_CSV = "rfid_access_log.csv"
 
-# ---------------- Global State ----------------
-auth_state = {
-    "face_verified": False,
-    "rfid_verified": False,
-    "operator_name": None,
-    "rfid_id": None
-}
-auth_lock = Lock()
+# ---------------- LOGGING ----------------
+def log_event(csv_file, name, event):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    exists = os.path.exists(csv_file)
+    with open(csv_file, "a", newline="") as f:
+        writer = csv.writer(f)
+        if not exists:
+            writer.writerow(["Name","Event","Timestamp"])
+        writer.writerow([name,event,now])
 
-# ---------------- Load Face Database ----------------
-face_detector = dlib.get_frontal_face_detector()
-predictor = dlib.shape_predictor('data/data_dlib/shape_predictor_68_face_landmarks.dat')
-face_model = dlib.face_recognition_model_v1("data/data_dlib/dlib_face_recognition_resnet_model_v1.dat")
+# ---------------- FACE DETECTION WITH CAMERA ----------------
+def detect_face(face_label, status_label):
+    cap = cv2.VideoCapture(0)
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    detected = False
 
-face_names = []
-face_features = []
+    while not detected:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
+        # Draw rectangles on detected faces
+        for (x, y, w, h) in faces:
+            cv2.rectangle(frame, (x,y), (x+w, y+h), (0,255,0), 2)
 
-if os.path.exists("data/features_all.csv"):
-    df = pd.read_csv("data/features_all.csv", header=None)
-    for i in range(df.shape[0]):
-        face_names.append(df.iloc[i][0])
-        face_features.append([df.iloc[i][j] for j in range(1, 129)])
-else:
-    print("❌ Face database missing!")
-    exit()
+        # Convert image to Tkinter format
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(rgb_frame)
+        imgtk = ImageTk.PhotoImage(image=img)
+        face_label.imgtk = imgtk
+        face_label.configure(image=imgtk)
 
-# ---------------- Load RFID DB ----------------
-conn = sqlite3.connect("rfid_tags.db")
-c = conn.cursor()
-c.execute("CREATE TABLE IF NOT EXISTS rfid_users (id INTEGER PRIMARY KEY AUTOINCREMENT, rfid_id INTEGER UNIQUE, name TEXT)")
-c.execute("SELECT rfid_id, name FROM rfid_users")
-rfid_to_name = {str(row[0]): row[1] for row in c.fetchall()}
-conn.close()
+        if len(faces) > 0:
+            # Simulate recognition and name mapping
+            name = "Vadeendra"
+            auth_state["face_verified"] = True
+            auth_state["name"] = name
+            status_label.config(text=f"✅ Face Verified: {name}")
+            log_event(FACE_CSV, name, "Face Detected")
+            detected = True
 
-# ---------------- CSV Logging ----------------
-LOG_FILE = "access_log.csv"
+        face_label.update()
+        status_label.update()
+        time.sleep(0.03)
 
-def log_access(name, open_time, close_time):
-    date_str = open_time.split(" ")[0]
-    file_exists = os.path.isfile(LOG_FILE)
-    with open(LOG_FILE, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["Name", "Date", "Open Time", "Close Time"])
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow({"Name": name, "Date": date_str, "Open Time": open_time, "Close Time": close_time})
+    cap.release()
 
-# ---------------- Face Detection Thread ----------------
-class FaceThread(Thread):
-    def __init__(self, callback):
-        super().__init__()
-        self.callback = callback
-        self.cap = cv2.VideoCapture(0)
-    def run(self):
-        while True:
-            ret, frame = self.cap.read()
-            if not ret:
-                continue
-            faces = face_detector(frame, 0)
-            for face in faces:
-                shape = predictor(frame, face)
-                feature = face_model.compute_face_descriptor(frame, shape)
-                distances = [np.linalg.norm(np.array(feature)-np.array(f)) for f in face_features]
-                if distances and min(distances) < 0.6:
-                    name = face_names[distances.index(min(distances))]
-                    with auth_lock:
-                        auth_state["face_verified"] = True
-                        auth_state["operator_name"] = name
-                    print(f"✅ Face verified: {name}")
-                    self.callback()
-                    self.cap.release()
-                    cv2.destroyAllWindows()
-                    return
-            time.sleep(0.05)
+# ---------------- RFID DETECTION (SIMULATED) ----------------
+def detect_rfid(status_label):
+    # Simulate waiting for RFID tag
+    time.sleep(2)
+    tag_name = "Vadeendra"
+    if auth_state["face_verified"] and auth_state["name"] == tag_name:
+        auth_state["rfid_verified"] = True
+        status_label.config(text=f"✅ RFID Verified ({tag_name})")
+        log_event(RFID_CSV, tag_name, "RFID Detected")
+    else:
+        status_label.config(text="❌ RFID mismatch with Face")
 
-# ---------------- RFID Detection Thread ----------------
-class RFIDThread(Thread):
-    def __init__(self, callback):
-        super().__init__()
-        self.callback = callback
-        self.reader = SimpleMFRC522()
-    def run(self):
-        while True:
-            rfid_id, _ = self.reader.read_no_block()
-            if rfid_id:
-                rfid_str = str(rfid_id)
-                if rfid_str in rfid_to_name:
-                    with auth_lock:
-                        auth_state["rfid_verified"] = True
-                        auth_state["rfid_id"] = rfid_str
-                        auth_state["operator_name"] = rfid_to_name[rfid_str]
-                    print(f"✅ RFID verified: {rfid_to_name[rfid_str]}")
-                    self.callback()
-                    return
-            time.sleep(0.1)
+# ---------------- RELAY CONTROL ----------------
+def open_relay_control():
+    if auth_state["face_verified"] and auth_state["rfid_verified"]:
+        relay_win = tk.Toplevel()
+        relay_win.title("Relay Control Panel")
+        relay_win.geometry("300x200")
+        relay_win.grab_set()
 
-# ---------------- Motor Control Functions ----------------
-def motorA_forward(speed=80):
-    GPIO.output(IN1, GPIO.HIGH)
-    GPIO.output(IN2, GPIO.LOW)
-    pwmA.ChangeDutyCycle(speed)
+        def relay_on():
+            GPIO.output(RELAY_GPIO, GPIO.HIGH)
+            print("Relay ON")
 
-def motorA_stop():
-    GPIO.output(IN1, GPIO.LOW)
-    GPIO.output(IN2, GPIO.LOW)
-    pwmA.ChangeDutyCycle(0)
+        def relay_off():
+            GPIO.output(RELAY_GPIO, GPIO.LOW)
+            print("Relay OFF")
 
-def motorB_forward(speed=80):
-    GPIO.output(IN3, GPIO.HIGH)
-    GPIO.output(IN4, GPIO.LOW)
-    pwmB.ChangeDutyCycle(speed)
+        tk.Label(relay_win, text=f"Welcome {auth_state['name']}", font=("Arial",12,"bold")).pack(pady=10)
+        tk.Button(relay_win, text="Relay ON", command=relay_on, width=15).pack(pady=5)
+        tk.Button(relay_win, text="Relay OFF", command=relay_off, width=15).pack(pady=5)
+        relay_win.mainloop()
+    else:
+        print("Both Face and RFID must be verified first.")
 
-def motorB_stop():
-    GPIO.output(IN3, GPIO.LOW)
-    GPIO.output(IN4, GPIO.LOW)
-    pwmB.ChangeDutyCycle(0)
+# ---------------- GUI ----------------
+root = tk.Tk()
+root.title("Access Control System")
+root.geometry("650x400")
 
-# ---------------- Motor Control GUI ----------------
-class MotorGUI:
-    def __init__(self, parent):
-        self.win = tk.Toplevel(parent)
-        self.win.title("Motor Control")
-        self.win.geometry("350x250")
-        self.open_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.operator_name = auth_state["operator_name"]
-        self.create_widgets()
+# Navbar with date & time
+navbar = tk.Label(root, text="", bg="lightgrey", font=("Arial", 12))
+navbar.pack(fill=tk.X)
+def update_time():
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    navbar.config(text=f"Current Date & Time: {now}")
+    root.after(500, update_time)
+update_time()
 
-    def create_widgets(self):
-        tk.Label(self.win, text=f"Operator: {self.operator_name}", font=("Arial", 12, "bold")).pack(pady=10)
-        # Motor 1
-        tk.Button(self.win, text="Motor 1 ON", command=lambda: motorA_forward()).pack(pady=5)
-        tk.Button(self.win, text="Motor 1 OFF", command=lambda: motorA_stop()).pack(pady=5)
-        # Motor 2
-        tk.Button(self.win, text="Motor 2 ON", command=lambda: motorB_forward()).pack(pady=5)
-        tk.Button(self.win, text="Motor 2 OFF", command=lambda: motorB_stop()).pack(pady=5)
-        self.win.protocol("WM_DELETE_WINDOW", self.on_close)
+# Main frame with 2 sections
+main_frame = tk.Frame(root)
+main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-    def show(self):
-        self.win.grab_set()
-        self.win.wait_window()
+# Left Frame: Face Detection
+left_frame = tk.LabelFrame(main_frame, text="Face Detection", width=300, height=300)
+left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-    def on_close(self):
-        motorA_stop()
-        motorB_stop()
-        close_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_access(self.operator_name, self.open_time, close_time)
-        with auth_lock:
-            auth_state["face_verified"] = False
-            auth_state["rfid_verified"] = False
-            auth_state["rfid_id"] = None
-            auth_state["operator_name"] = None
-        self.win.destroy()
+face_label = tk.Label(left_frame, text="Camera Feed", width=30, height=12, bg="black")
+face_label.pack(pady=5)
+face_status_label = tk.Label(left_frame, text="Not Started")
+face_status_label.pack(pady=5)
+tk.Button(left_frame, text="Start Face Detection", 
+          command=lambda: threading.Thread(target=detect_face, args=(face_label, face_status_label)).start()).pack(pady=5)
 
-# ---------------- Home GUI ----------------
-class HomeGUI:
-    def __init__(self):
-        self.root = tk.Tk()
-        self.root.title("Home - Access Control")
-        self.root.geometry("400x300")
-        self.face_tick = tk.StringVar(value="❌")
-        self.rfid_tick = tk.StringVar(value="❌")
-        self.create_widgets()
-        self.update_time()
-        self.root.mainloop()
+# Right Frame: RFID Detection
+right_frame = tk.LabelFrame(main_frame, text="RFID Detection", width=300, height=300)
+right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-    def create_widgets(self):
-        self.time_label = tk.Label(self.root, font=("Arial", 14))
-        self.time_label.pack(pady=10)
+rfid_status_label = tk.Label(right_frame, text="Not Started")
+rfid_status_label.pack(pady=20)
+tk.Button(right_frame, text="Start RFID Detection", 
+          command=lambda: threading.Thread(target=detect_rfid, args=(rfid_status_label,)).start()).pack(pady=5)
 
-        self.face_btn = tk.Button(self.root, text="Face Detection", width=20, command=self.start_face_detection)
-        self.face_btn.pack(pady=5)
-        tk.Label(self.root, textvariable=self.face_tick, font=("Arial", 14)).pack()
+# Check button to open relay control if both verified
+tk.Button(root, text="Open Relay Control", command=open_relay_control, bg="green", fg="white").pack(pady=10)
 
-        self.rfid_btn = tk.Button(self.root, text="RFID Detection", width=20, command=self.start_rfid_detection)
-        self.rfid_btn.pack(pady=5)
-        tk.Label(self.root, textvariable=self.rfid_tick, font=("Arial", 14)).pack()
+root.mainloop()
 
-    def update_time(self):
-        self.time_label.config(text=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        self.root.after(1000, self.update_time)
-
-    def start_face_detection(self):
-        self.face_tick.set("⏳")
-        FaceThread(callback=self.face_detected).start()
-
-    def start_rfid_detection(self):
-        self.rfid_tick.set("⏳")
-        RFIDThread(callback=self.rfid_detected).start()
-
-    def face_detected(self):
-        self.face_tick.set("✅")
-        self.check_both_verified()
-
-    def rfid_detected(self):
-        self.rfid_tick.set("✅")
-        self.check_both_verified()
-      
-    def check_both_verified(self):
-        with auth_lock:
-            # Check if both face and RFID verified and names match
-            if auth_state["face_verified"] and auth_state["rfid_verified"]:
-                if rfid_to_name.get(auth_state["rfid_id"]) == auth_state["operator_name"]:
-                    # Open Motor Control GUI
-                    MotorGUI(self.root).show()
-                    # Reset ticks after closing Motor GUI
-                    self.face_tick.set("❌")
-                    self.rfid_tick.set("❌")
-                else:
-                    print(f"❌ Face-RFID mismatch: {auth_state['operator_name']} vs {rfid_to_name.get(auth_state['rfid_id'])}")
-                    tk.messagebox.showerror("Mismatch", "Face and RFID do not match!")
-                    # Reset only RFID to retry
-                    self.rfid_tick.set("❌")
-                    auth_state["rfid_verified"] = False
-                    auth_state["rfid_id"] = None
-
-# ---------------- MAIN ----------------
-if __name__ == "__main__":
-    try:
-        HomeGUI()
-    except KeyboardInterrupt:
-        print("Exiting...")
-    finally:
-        motorA_stop()
-        motorB_stop()
-        GPIO.cleanup()
+# Cleanup GPIO on exit
+GPIO.output(RELAY_GPIO, GPIO.LOW)
+GPIO.cleanup()
