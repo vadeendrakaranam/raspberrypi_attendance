@@ -1,7 +1,6 @@
 import sys
 import os
 sys.path.insert(0, os.path.abspath("/home/project/Desktop/Att/lib"))
-import os
 import time
 import datetime
 import pandas as pd
@@ -28,6 +27,10 @@ csv_mutex = Lock()
 MASTER_TAG = "769839607204"
 MASTER_NAME = "Universal"
 
+# ---------------- COOL DOWN CONFIG ----------------
+COOLDOWN_TIME = 10  # seconds per user
+user_last_action = {}  # tracks last action time per user
+
 # ---------------- CSV INIT ----------------
 def init_csv():
     if not os.path.exists(LOG_FILE):
@@ -43,7 +46,6 @@ def log_entry(method, identifier, open_time="", close_time="", detected_time="")
         if open_time:
             df.loc[len(df)] = [method, identifier, open_time, "", ""]
         elif close_time:
-            # update last open entry
             mask = (df["Close Timestamp"] == "") & (df["Open Timestamp"] != "")
             if mask.any():
                 idx = df[mask].index[-1]
@@ -60,22 +62,37 @@ current_user = None
 lock_mutex = Lock()
 
 def open_lock(method, identifier):
-    global lock_open, current_user
+    global lock_open, current_user, user_last_action
     with lock_mutex:
+        last_time = user_last_action.get(identifier, 0)
+        if time.time() - last_time < COOLDOWN_TIME:
+            print(f"⏳ Cooldown active for {identifier} — ignoring open request")
+            return
+
         if not lock_open:
             GPIO.output(RELAY_GPIO, GPIO.HIGH)
             lock_open = True
             current_user = identifier
+            user_last_action[identifier] = time.time()
             log_entry(method, identifier, open_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             print(f"🔓 Lock opened by {identifier}")
 
 def close_lock():
-    global lock_open, current_user
+    global lock_open, current_user, user_last_action
     with lock_mutex:
+        if current_user is None:
+            return
+
+        last_time = user_last_action.get(current_user, 0)
+        if time.time() - last_time < COOLDOWN_TIME:
+            print(f"⏳ Cooldown active for {current_user} — ignoring close request")
+            return
+
         if lock_open:
             GPIO.output(RELAY_GPIO, GPIO.LOW)
             log_entry("RFID", current_user, close_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             print(f"🔒 Lock closed by {current_user}")
+            user_last_action[current_user] = time.time()
             lock_open = False
             current_user = None
 
@@ -90,6 +107,7 @@ def check_last_lock_state():
             GPIO.output(RELAY_GPIO, GPIO.HIGH)
             lock_open = True
             current_user = last["Identifier"]
+            user_last_action[current_user] = time.time()
             print(f"🔓 Lock opened on startup by {current_user} (last session not closed)")
         else:
             GPIO.output(RELAY_GPIO, GPIO.LOW)
@@ -103,15 +121,19 @@ check_last_lock_state()
 reader = SimpleMFRC522()
 
 def handle_rfid_detection(tag_id):
-    global lock_open, current_user
+    global lock_open, current_user, user_last_action
 
     tag_str = str(tag_id)
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # ✅ MASTER / UNIVERSAL TAG LOGIC
+    # MASTER TAG LOGIC
     if tag_str == MASTER_TAG:
         if lock_open:
-            # Close the lock if open
+            last_time = user_last_action.get(MASTER_NAME, 0)
+            if time.time() - last_time < COOLDOWN_TIME:
+                print(f"⏳ Cooldown active for {MASTER_NAME} — ignoring request")
+                return
+
             print(f"📟 Detected {MASTER_NAME} (master) — closing lock...")
             df = pd.read_csv(LOG_FILE)
             if not df.empty:
@@ -125,19 +147,25 @@ def handle_rfid_detection(tag_id):
             print(f"🔒 Lock closed by {MASTER_NAME}")
             lock_open = False
             current_user = None
+            user_last_action[MASTER_NAME] = time.time()
         else:
-            # Open lock if closed
+            last_time = user_last_action.get(MASTER_NAME, 0)
+            if time.time() - last_time < COOLDOWN_TIME:
+                print(f"⏳ Cooldown active for {MASTER_NAME} — ignoring request")
+                return
+
             print(f"📟 Detected {MASTER_NAME} (master) — opening lock...")
             GPIO.output(RELAY_GPIO, GPIO.HIGH)
             lock_open = True
             current_user = MASTER_NAME
+            user_last_action[MASTER_NAME] = time.time()
             df = pd.read_csv(LOG_FILE)
             df.loc[len(df)] = ["RFID", MASTER_NAME, now, "", ""]
             df.to_csv(LOG_FILE, index=False)
             print(f"🔓 Lock opened by {MASTER_NAME}")
         return
 
-    # ✅ NORMAL RFID USERS
+    # NORMAL RFID USERS
     conn = sqlite3.connect("rfid_data.db")
     cursor = conn.cursor()
     cursor.execute("SELECT name FROM rfid_users WHERE tag_id=?", (tag_str,))
@@ -154,10 +182,8 @@ def handle_rfid_detection(tag_id):
 
     if lock_open:
         if current_user == identifier:
-            # same user tries to close
             close_lock()
         else:
-            # log detection
             print(f"📟 Detected {identifier} (lock already opened)")
             log_entry("RFID", identifier, detected_time=now)
     else:
@@ -187,7 +213,7 @@ def load_face_db():
 load_face_db()
 
 def face_thread():
-    global lock_open, current_user
+    global lock_open, current_user, user_last_action
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
@@ -208,8 +234,12 @@ def face_thread():
                     identifier = name
                     cv2.rectangle(frame, (face.left(), face.top()), (face.right(), face.bottom()), (255, 255, 0), 2)
                     cv2.putText(frame, name, (face.left(), face.top()-10), font, 0.6, (0, 255, 255), 1)
+                    last_time = user_last_action.get(identifier, 0)
                     if lock_open and current_user == identifier:
-                        close_lock()
+                        if time.time() - last_time >= COOLDOWN_TIME:
+                            close_lock()
+                        else:
+                            print(f"⏳ Cooldown active for {identifier} — ignoring close")
                     elif not lock_open:
                         open_lock("FACE", identifier)
                     else:
