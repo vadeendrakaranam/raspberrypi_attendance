@@ -12,9 +12,10 @@ from threading import Thread, Lock
 
 # ---------------- GPIO SETUP ----------------
 RELAY_GPIO = 11
+GPIO.setwarnings(False)
 GPIO.setmode(GPIO.BOARD)
 GPIO.setup(RELAY_GPIO, GPIO.OUT)
-GPIO.output(RELAY_GPIO, GPIO.LOW)
+GPIO.output(RELAY_GPIO, GPIO.LOW)  # initially closed
 
 # ---------------- CSV LOG ----------------
 CSV_FILE = "access_log.csv"
@@ -30,57 +31,63 @@ init_csv()
 def log_entry(method, identifier, open_time="", close_time="", detected_time=""):
     with csv_mutex:
         df = pd.read_csv(CSV_FILE)
-        # Open event
+        # Opened user
         if open_time:
             mask = (df["Method"]==method) & (df["Identifier"]==identifier) & (df["Open Timestamp"]!="") & (df["Close Timestamp"]=="")
             if not mask.any():
-                df = pd.concat([df, pd.DataFrame([[method,identifier,open_time,"",""]], columns=columns)], ignore_index=True)
-        # Close event
-        elif close_time:
-            mask = (df["Identifier"]==identifier) & (df["Close Timestamp"]=="") & (df["Open Timestamp"]!="")
+                df = pd.concat([df, pd.DataFrame([[method, identifier, open_time, "", ""]], columns=columns)], ignore_index=True)
+        # Close the lock
+        if close_time:
+            mask = (df["Method"]==method) & (df["Identifier"]==identifier) & (df["Open Timestamp"]!="") & (df["Close Timestamp"]=="")
             if mask.any():
                 idx = df[mask].index[-1]
                 df.at[idx,"Close Timestamp"] = close_time
-        # Detected event only
-        elif detected_time:
-            df = pd.concat([df, pd.DataFrame([[method,identifier,"","",detected_time]], columns=columns)], ignore_index=True)
+        # Detected only
+        if detected_time:
+            df = pd.concat([df, pd.DataFrame([[method, identifier, "", "", detected_time]], columns=columns)], ignore_index=True)
         df.to_csv(CSV_FILE,index=False)
 
 # ---------------- LOCK STATE ----------------
 lock_status = "CLOSED"
 current_user = None
 lock_open_time = 0
-ignore_duration = 10  # seconds
+ignore_duration = 10  # seconds cooldown
 lock_mutex = Lock()
-current_method = ""
+last_close_time = {}
 
 def open_lock(method, identifier):
-    global lock_status, current_user, lock_open_time, current_method
+    global lock_status, current_user, lock_open_time
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with lock_mutex:
+        # Cooldown check
+        if identifier in last_close_time and time.time() - last_close_time[identifier] < ignore_duration:
+            print(f"⏱ Cooldown active for {identifier}, lock not opened")
+            log_entry(method, identifier, detected_time=now)
+            return
         if lock_status=="CLOSED":
             GPIO.output(RELAY_GPIO, GPIO.HIGH)
             lock_status="OPEN"
             current_user = identifier
-            current_method = method
             lock_open_time = time.time()
-            log_entry(method, identifier, open_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            log_entry(method, identifier, open_time=now)
             print(f"🔓 Lock opened by {identifier}")
 
 def close_lock():
-    global lock_status, current_user, current_method
+    global lock_status, current_user
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with lock_mutex:
         if lock_status=="OPEN" and current_user:
-            if time.time()-lock_open_time >= ignore_duration:
+            if time.time() - lock_open_time >= ignore_duration:
                 GPIO.output(RELAY_GPIO, GPIO.LOW)
-                log_entry(current_method, current_user, close_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                log_entry(method=current_user.split(":")[0], identifier=current_user, close_time=now)
                 print(f"🔒 Lock closed by {current_user}")
-                current_user=None
-                current_method=""
+                last_close_time[current_user] = time.time()
+                current_user = None
                 lock_status="CLOSED"
 
-# ---------------- REBOOT RECOVERY ----------------
+# ---------------- STARTUP RECOVERY ----------------
 def check_last_lock_state():
-    global lock_status, current_user, lock_open_time, current_method
+    global lock_status, current_user, lock_open_time
     df = pd.read_csv(CSV_FILE)
     if not df.empty:
         mask = (df["Open Timestamp"]!="") & (df["Close Timestamp"]=="")
@@ -88,22 +95,17 @@ def check_last_lock_state():
             last = df[mask].iloc[-1]
             lock_status="OPEN"
             current_user = last["Identifier"]
-            current_method = last["Method"]
             lock_open_time = time.time()
             GPIO.output(RELAY_GPIO, GPIO.HIGH)
             print(f"🔓 Lock opened on startup by {current_user} (last session not closed)")
         else:
             GPIO.output(RELAY_GPIO, GPIO.LOW)
             print("🔒 Lock closed on startup")
-    else:
-        GPIO.output(RELAY_GPIO, GPIO.LOW)
-        print("🔒 Lock closed on startup")
 
 check_last_lock_state()
 
 # ---------------- RFID ----------------
 reader = SimpleMFRC522()
-
 def init_rfid_db():
     conn = sqlite3.connect("rfid_data.db")
     cursor = conn.cursor()
