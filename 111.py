@@ -14,7 +14,7 @@ from threading import Thread, Lock
 RELAY_GPIO = 11
 GPIO.setmode(GPIO.BOARD)
 GPIO.setup(RELAY_GPIO, GPIO.OUT)
-GPIO.output(RELAY_GPIO, GPIO.LOW)  # initially closed
+GPIO.output(RELAY_GPIO, GPIO.LOW)
 
 # ---------------- CSV LOG ----------------
 CSV_FILE = "access_log.csv"
@@ -30,23 +30,20 @@ init_csv()
 def log_entry(method, identifier, open_time="", close_time="", detected_time=""):
     with csv_mutex:
         df = pd.read_csv(CSV_FILE)
-        # --- If user opened the lock, update or create row ---
+        # Open event
         if open_time:
             mask = (df["Method"]==method) & (df["Identifier"]==identifier) & (df["Open Timestamp"]!="") & (df["Close Timestamp"]=="")
-            if mask.any():
-                # Already has open, do nothing
-                pass
-            else:
-                df = pd.concat([df,pd.DataFrame([[method,identifier,open_time,"",""]],columns=columns)],ignore_index=True)
-        # --- If closing ---
+            if not mask.any():
+                df = pd.concat([df, pd.DataFrame([[method,identifier,open_time,"",""]], columns=columns)], ignore_index=True)
+        # Close event
         elif close_time:
-            mask = (df["Method"]==method) & (df["Identifier"]==identifier) & (df["Close Timestamp"]=="") & (df["Open Timestamp"]!="")
+            mask = (df["Identifier"]==identifier) & (df["Close Timestamp"]=="") & (df["Open Timestamp"]!="")
             if mask.any():
                 idx = df[mask].index[-1]
                 df.at[idx,"Close Timestamp"] = close_time
-        # --- Detected only ---
+        # Detected event only
         elif detected_time:
-            df = pd.concat([df,pd.DataFrame([[method,identifier,"","",detected_time]],columns=columns)],ignore_index=True)
+            df = pd.concat([df, pd.DataFrame([[method,identifier,"","",detected_time]], columns=columns)], ignore_index=True)
         df.to_csv(CSV_FILE,index=False)
 
 # ---------------- LOCK STATE ----------------
@@ -55,70 +52,58 @@ current_user = None
 lock_open_time = 0
 ignore_duration = 10  # seconds
 lock_mutex = Lock()
+current_method = ""
 
 def open_lock(method, identifier):
-    global lock_status, current_user, lock_open_time
+    global lock_status, current_user, lock_open_time, current_method
     with lock_mutex:
         if lock_status=="CLOSED":
             GPIO.output(RELAY_GPIO, GPIO.HIGH)
             lock_status="OPEN"
             current_user = identifier
+            current_method = method
             lock_open_time = time.time()
             log_entry(method, identifier, open_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             print(f"🔓 Lock opened by {identifier}")
 
 def close_lock():
-    global lock_status, current_user, lock_open_time
+    global lock_status, current_user, current_method
     with lock_mutex:
         if lock_status=="OPEN" and current_user:
             if time.time()-lock_open_time >= ignore_duration:
                 GPIO.output(RELAY_GPIO, GPIO.LOW)
-                log_entry("","",close_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), identifier=current_user)
+                log_entry(current_method, current_user, close_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                 print(f"🔒 Lock closed by {current_user}")
                 current_user=None
+                current_method=""
                 lock_status="CLOSED"
 
 # ---------------- REBOOT RECOVERY ----------------
 def check_last_lock_state():
-    global lock_status, current_user, lock_open_time
-    if not os.path.exists(CSV_FILE):
-        GPIO.output(RELAY_GPIO, GPIO.LOW)
-        print("🔒 Lock closed on startup (CSV not found)")
-        return
-
+    global lock_status, current_user, lock_open_time, current_method
     df = pd.read_csv(CSV_FILE)
-    if df.empty:
-        GPIO.output(RELAY_GPIO, GPIO.LOW)
-        print("🔒 Lock closed on startup (CSV empty)")
-        return
-
-    # Only consider rows with a valid Open Timestamp
-    open_rows = df[df["Open Timestamp"].notna() & (df["Open Timestamp"] != "")]
-    if open_rows.empty:
-        GPIO.output(RELAY_GPIO, GPIO.LOW)
-        print("🔒 Lock closed on startup (no previous open records)")
-        return
-
-    # Last opened row
-    last_row = open_rows.iloc[-1]
-
-    # Open lock only if Close Timestamp is empty
-    if "Close Timestamp" in last_row and (last_row["Close Timestamp"] == "" or pd.isna(last_row["Close Timestamp"])):
-        current_user = last_row["Identifier"]
-        lock_status = "OPEN"
-        lock_open_time = time.time()
-        GPIO.output(RELAY_GPIO, GPIO.HIGH)
-        print(f"🔓 Lock opened on startup by {current_user} (last session not closed)")
+    if not df.empty:
+        mask = (df["Open Timestamp"]!="") & (df["Close Timestamp"]=="")
+        if mask.any():
+            last = df[mask].iloc[-1]
+            lock_status="OPEN"
+            current_user = last["Identifier"]
+            current_method = last["Method"]
+            lock_open_time = time.time()
+            GPIO.output(RELAY_GPIO, GPIO.HIGH)
+            print(f"🔓 Lock opened on startup by {current_user} (last session not closed)")
+        else:
+            GPIO.output(RELAY_GPIO, GPIO.LOW)
+            print("🔒 Lock closed on startup")
     else:
         GPIO.output(RELAY_GPIO, GPIO.LOW)
-        lock_status = "CLOSED"
-        current_user = None
-        print("🔒 Lock closed on startup (last session already closed)")
+        print("🔒 Lock closed on startup")
 
 check_last_lock_state()
 
 # ---------------- RFID ----------------
 reader = SimpleMFRC522()
+
 def init_rfid_db():
     conn = sqlite3.connect("rfid_data.db")
     cursor = conn.cursor()
@@ -157,7 +142,6 @@ def rfid_thread():
             elif lock_status=="CLOSED":
                 open_lock("RFID", identifier)
             else:
-                # detected only
                 log_entry("RFID", identifier, detected_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                 print(f"📟 Detected {identifier} (lock already opened)")
         time.sleep(0.1)
