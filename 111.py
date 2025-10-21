@@ -11,6 +11,7 @@ import cv2
 import dlib
 import numpy as np
 from threading import Thread, Lock
+import json
 
 # ---------------- GPIO SETUP ----------------
 GPIO.setwarnings(False)
@@ -21,6 +22,7 @@ GPIO.output(RELAY_GPIO, GPIO.LOW)  # initially closed
 
 # ---------------- FILES & CONFIG ----------------
 LOG_FILE = "access_log.csv"
+COOLDOWN_FILE = "cooldown.json"
 columns = ["Method", "Identifier", "Open Timestamp", "Close Timestamp", "Detected Timestamp"]
 csv_mutex = Lock()
 
@@ -30,6 +32,7 @@ MASTER_NAME = "Universal"
 # ---------------- COOL DOWN CONFIG ----------------
 COOLDOWN_TIME = 10  # seconds per user
 user_last_action = {}  # tracks last action time per user
+cooldown_mutex = Lock()
 
 # ---------------- CSV INIT ----------------
 def init_csv():
@@ -61,6 +64,20 @@ lock_open = False
 current_user = None
 lock_mutex = Lock()
 
+def save_cooldown():
+    with cooldown_mutex:
+        with open(COOLDOWN_FILE, "w") as f:
+            json.dump(user_last_action, f)
+
+def load_cooldown():
+    global user_last_action
+    if os.path.exists(COOLDOWN_FILE):
+        with open(COOLDOWN_FILE, "r") as f:
+            try:
+                user_last_action = json.load(f)
+            except:
+                user_last_action = {}
+
 def open_lock(method, identifier):
     global lock_open, current_user, user_last_action
     with lock_mutex:
@@ -73,7 +90,8 @@ def open_lock(method, identifier):
             GPIO.output(RELAY_GPIO, GPIO.HIGH)
             lock_open = True
             current_user = identifier
-            user_last_action[identifier] = time.time()
+            with cooldown_mutex:
+                user_last_action[identifier] = time.time()
             log_entry(method, identifier, open_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             print(f"🔓 Lock opened by {identifier}")
 
@@ -92,7 +110,8 @@ def close_lock():
             GPIO.output(RELAY_GPIO, GPIO.LOW)
             log_entry("RFID", current_user, close_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             print(f"🔒 Lock closed by {current_user}")
-            user_last_action[current_user] = time.time()
+            with cooldown_mutex:
+                user_last_action[current_user] = time.time()
             lock_open = False
             current_user = None
 
@@ -107,7 +126,8 @@ def check_last_lock_state():
             GPIO.output(RELAY_GPIO, GPIO.HIGH)
             lock_open = True
             current_user = last["Identifier"]
-            user_last_action[current_user] = time.time()
+            with cooldown_mutex:
+                user_last_action[current_user] = time.time()
             print(f"🔓 Lock opened on startup by {current_user} (last session not closed)")
         else:
             GPIO.output(RELAY_GPIO, GPIO.LOW)
@@ -116,6 +136,7 @@ def check_last_lock_state():
         print("🔒 Lock closed on startup")
 
 check_last_lock_state()
+load_cooldown()
 
 # ---------------- RFID SETUP ----------------
 reader = SimpleMFRC522()
@@ -128,12 +149,12 @@ def handle_rfid_detection(tag_id):
 
     # MASTER TAG LOGIC
     if tag_str == MASTER_TAG:
-        if lock_open:
-            last_time = user_last_action.get(MASTER_NAME, 0)
-            if time.time() - last_time < COOLDOWN_TIME:
-                print(f"⏳ Cooldown active for {MASTER_NAME} — ignoring request")
-                return
+        last_time = user_last_action.get(MASTER_NAME, 0)
+        if time.time() - last_time < COOLDOWN_TIME:
+            print(f"⏳ Cooldown active for {MASTER_NAME} — ignoring request")
+            return
 
+        if lock_open:
             print(f"📟 Detected {MASTER_NAME} (master) — closing lock...")
             df = pd.read_csv(LOG_FILE)
             if not df.empty:
@@ -147,22 +168,17 @@ def handle_rfid_detection(tag_id):
             print(f"🔒 Lock closed by {MASTER_NAME}")
             lock_open = False
             current_user = None
-            user_last_action[MASTER_NAME] = time.time()
         else:
-            last_time = user_last_action.get(MASTER_NAME, 0)
-            if time.time() - last_time < COOLDOWN_TIME:
-                print(f"⏳ Cooldown active for {MASTER_NAME} — ignoring request")
-                return
-
             print(f"📟 Detected {MASTER_NAME} (master) — opening lock...")
             GPIO.output(RELAY_GPIO, GPIO.HIGH)
             lock_open = True
             current_user = MASTER_NAME
-            user_last_action[MASTER_NAME] = time.time()
             df = pd.read_csv(LOG_FILE)
             df.loc[len(df)] = ["RFID", MASTER_NAME, now, "", ""]
             df.to_csv(LOG_FILE, index=False)
             print(f"🔓 Lock opened by {MASTER_NAME}")
+        with cooldown_mutex:
+            user_last_action[MASTER_NAME] = time.time()
         return
 
     # NORMAL RFID USERS
@@ -255,17 +271,26 @@ def face_thread():
     cap.release()
     cv2.destroyAllWindows()
 
+# ---------------- PERSIST COOLDOWN PERIODICALLY ----------------
+def cooldown_saver_thread():
+    while True:
+        save_cooldown()
+        time.sleep(5)  # save every 5 seconds
+
 # ---------------- MAIN ----------------
 if __name__ == "__main__":
     try:
         t1 = Thread(target=rfid_thread)
         t2 = Thread(target=face_thread)
+        t3 = Thread(target=cooldown_saver_thread, daemon=True)
         t1.start()
         t2.start()
+        t3.start()
         t1.join()
         t2.join()
     except KeyboardInterrupt:
         print("Exiting...")
     finally:
+        save_cooldown()
         GPIO.output(RELAY_GPIO, GPIO.LOW)
         print("🔒 Lock closed on exit")
