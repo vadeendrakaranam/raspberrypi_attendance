@@ -10,10 +10,9 @@ import dlib
 import numpy as np
 from threading import Thread, Lock
 
-# ---------------- GPIO SETUP ----------------
+# ---------------- GPIO ----------------
 RELAY_GPIO = 11
 GPIO.setmode(GPIO.BOARD)
-GPIO.setwarnings(False)
 GPIO.setup(RELAY_GPIO, GPIO.OUT)
 GPIO.output(RELAY_GPIO, GPIO.LOW)  # initially closed
 
@@ -22,29 +21,25 @@ CSV_FILE = "access_log.csv"
 csv_mutex = Lock()
 columns = ["Method","Identifier","Open Timestamp","Close Timestamp","Detected Timestamp"]
 
-def init_csv():
-    if not os.path.exists(CSV_FILE):
-        pd.DataFrame(columns=columns).to_csv(CSV_FILE,index=False)
-init_csv()
+if not os.path.exists(CSV_FILE):
+    pd.DataFrame(columns=columns).to_csv(CSV_FILE,index=False)
 
 def log_entry(method, identifier, open_time="", close_time="", detected_time=""):
     with csv_mutex:
         df = pd.read_csv(CSV_FILE)
-        # --- If user opened the lock, update or create row ---
+        # OPEN
         if open_time:
             mask = (df["Method"]==method) & (df["Identifier"]==identifier) & (df["Open Timestamp"]!="") & (df["Close Timestamp"]=="")
-            if mask.any():
-                # Already open, do nothing
-                pass
-            else:
+            if not mask.any():
                 df = pd.concat([df,pd.DataFrame([[method,identifier,open_time,"",""]],columns=columns)],ignore_index=True)
-        # --- If closing ---
+        # CLOSE
         elif close_time:
-            mask = (df["Method"]==method) & (df["Identifier"]==identifier) & (df["Open Timestamp"]!="") & (df["Close Timestamp"]=="")
+            # update last opened user
+            mask = (df["Open Timestamp"]!="") & (df["Close Timestamp"]=="")
             if mask.any():
                 idx = df[mask].index[-1]
                 df.at[idx,"Close Timestamp"] = close_time
-        # --- Detected only ---
+        # DETECTED
         elif detected_time:
             df = pd.concat([df,pd.DataFrame([[method,identifier,"","",detected_time]],columns=columns)],ignore_index=True)
         df.to_csv(CSV_FILE,index=False)
@@ -53,40 +48,27 @@ def log_entry(method, identifier, open_time="", close_time="", detected_time="")
 lock_status = "CLOSED"
 current_user = None
 lock_open_time = 0
-ignore_duration = 10       # seconds lock stays open
-cooldown_duration = 10     # seconds cooldown per user
+ignore_duration = 10
 lock_mutex = Lock()
-MASTER_TAG = "MASTER"
-user_last_closed = {}      # last closed timestamp per user
 
 def open_lock(method, identifier):
     global lock_status, current_user, lock_open_time
     with lock_mutex:
-        now_time = time.time()
-        if identifier in user_last_closed and now_time - user_last_closed[identifier] < cooldown_duration:
-            print(f"⏱ User {identifier} in cooldown, cannot open yet")
-            return
-        if lock_status=="CLOSED":
-            GPIO.output(RELAY_GPIO, GPIO.HIGH)
-            lock_status="OPEN"
-            current_user = identifier
-            lock_open_time = now_time
-            log_entry(method, identifier, open_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-            print(f"🔓 Lock opened by {identifier}")
+        GPIO.output(RELAY_GPIO, GPIO.HIGH)
+        lock_status="OPEN"
+        current_user = identifier
+        lock_open_time = time.time()
+        log_entry(method, identifier, open_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        print(f"🔓 Lock opened by {identifier}")
 
-def close_lock(method=None, identifier=None):
+def close_lock():
     global lock_status, current_user
     with lock_mutex:
         if lock_status=="OPEN" and current_user:
             if time.time()-lock_open_time >= ignore_duration:
                 GPIO.output(RELAY_GPIO, GPIO.LOW)
-                now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                # Close the currently opened user
-                log_entry(method=current_user.split(":")[0] if ":" in current_user else "RFID",
-                          identifier=current_user, close_time=now_str)
+                log_entry(close_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                 print(f"🔒 Lock closed by {current_user}")
-                # cooldown update
-                user_last_closed[current_user] = time.time()
                 current_user=None
                 lock_status="CLOSED"
 
@@ -102,14 +84,17 @@ def check_last_lock_state():
             current_user = last["Identifier"]
             lock_open_time = time.time()
             GPIO.output(RELAY_GPIO, GPIO.HIGH)
-            print(f"🔓 Lock opened on startup by {current_user} (last session not closed)")
+            print(f"🔓 Lock opened on startup by {current_user}")
         else:
             GPIO.output(RELAY_GPIO, GPIO.LOW)
             print("🔒 Lock closed on startup")
+
 check_last_lock_state()
 
 # ---------------- RFID ----------------
 reader = SimpleMFRC522()
+MASTER_TAG = "MASTER"
+
 def init_rfid_db():
     conn = sqlite3.connect("rfid_data.db")
     cursor = conn.cursor()
@@ -120,54 +105,48 @@ def init_rfid_db():
     conn.commit()
     conn.close()
 
-def get_or_register_rfid(tag_id):
+def get_rfid_name(tag_id):
     conn = sqlite3.connect("rfid_data.db")
     cursor = conn.cursor()
     cursor.execute("SELECT name FROM rfid_users WHERE tag_id=?",(str(tag_id),))
     res = cursor.fetchone()
-    if res:
-        name = res[0]
-    else:
-        name = input(f"🆕 Enter name for new RFID tag {tag_id}: ").strip()
-        if name:
-            cursor.execute("INSERT INTO rfid_users(tag_id,name) VALUES (?,?)",(str(tag_id),name))
-            conn.commit()
     conn.close()
-    return name
+    return res[0] if res else None
 
 def rfid_thread():
-    global current_user
+    global current_user, lock_status, lock_open_time
     while True:
         uid, _ = reader.read_no_block()
         if uid:
-            name = get_or_register_rfid(uid)
-            identifier = f"{name}({uid})" if name != MASTER_TAG else MASTER_TAG
+            name = get_rfid_name(uid)
+            identifier = f"{name}({uid})" if name else f"UNKNOWN({uid})"
 
-            if identifier == MASTER_TAG:
-                now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # MASTER logic
+            if name == MASTER_TAG:
                 if lock_status=="OPEN":
-                    # close current opened user
-                    if current_user:
-                        log_entry(method=current_user.split(":")[0], identifier=current_user, close_time=now_str)
+                    # update last opened user close time
+                    log_entry(close_time=now)
                     GPIO.output(RELAY_GPIO, GPIO.LOW)
                     lock_status="CLOSED"
-                    print(f"🔒 Master closed the lock at {now_str}")
                     current_user=None
+                    print(f"🔒 Lock closed by MASTER at {now}")
+                    # log master detected
+                    log_entry("MASTER","MASTER",detected_time=now)
                 else:
-                    GPIO.output(RELAY_GPIO, GPIO.HIGH)
-                    lock_status="OPEN"
-                    current_user=MASTER_TAG
-                    lock_open_time=time.time()
-                    log_entry("MASTER", MASTER_TAG, open_time=now_str)
-                    print(f"🔓 Master opened the lock at {now_str}")
-            else:
+                    open_lock("MASTER","MASTER")
+            elif name:  # normal tag
                 if current_user==identifier:
                     close_lock()
-                elif lock_status=="CLOSED":
+                elif lock_status=="CLOSED" and (time.time()-lock_open_time>ignore_duration):
                     open_lock("RFID", identifier)
                 else:
-                    log_entry("RFID", identifier, detected_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                    log_entry("RFID",identifier,detected_time=now)
                     print(f"📟 Detected {identifier} (lock already opened)")
+            else:  # unknown
+                log_entry("RFID",identifier,detected_time=now)
+                print(f"❌ Unknown RFID detected: {identifier}")
         time.sleep(0.1)
 
 # ---------------- FACE ----------------
@@ -177,16 +156,14 @@ face_model = dlib.face_recognition_model_v1("data/data_dlib/dlib_face_recognitio
 
 known_features=[]
 known_names=[]
-def load_face_db():
-    if os.path.exists("data/features_all.csv"):
-        df = pd.read_csv("data/features_all.csv",header=None)
-        for i in range(df.shape[0]):
-            known_names.append(df.iloc[i,0])
-            known_features.append([df.iloc[i,j] for j in range(1,129)])
-load_face_db()
+if os.path.exists("data/features_all.csv"):
+    df_face = pd.read_csv("data/features_all.csv",header=None)
+    for i in range(df_face.shape[0]):
+        known_names.append(df_face.iloc[i,0])
+        known_features.append([df_face.iloc[i,j] for j in range(1,129)])
 
 def face_thread():
-    global current_user
+    global current_user, lock_status, lock_open_time
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,320)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT,240)
@@ -206,12 +183,14 @@ def face_thread():
                     identifier = name
                     cv2.rectangle(frame,(face.left(),face.top()),(face.right(),face.bottom()),(255,255,0),2)
                     cv2.putText(frame,name,(face.left(),face.top()-10),font,0.6,(0,255,255),1)
+
+                    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     if current_user==identifier:
                         close_lock()
-                    elif lock_status=="CLOSED":
+                    elif lock_status=="CLOSED" and (time.time()-lock_open_time>ignore_duration):
                         open_lock("FACE", identifier)
                     else:
-                        log_entry("FACE", identifier, detected_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                        log_entry("FACE",identifier,detected_time=now)
                         print(f"👤 Detected {identifier} (lock already opened)")
                 else:
                     log_entry("FACE","UNKNOWN",detected_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
