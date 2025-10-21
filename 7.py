@@ -5,226 +5,215 @@ import dlib
 import numpy as np
 import cv2
 import pandas as pd
-import time
 import datetime
-import csv
+import time
 import RPi.GPIO as GPIO
 from mfrc522 import SimpleMFRC522
-from threading import Thread, Lock
+from threading import Lock, Thread
 
-# ---------------- GPIO Setup ----------------
+# ---------------- GPIO SETUP ----------------
 RELAY_GPIO = 11
-GPIO.setwarnings(False)
 GPIO.setmode(GPIO.BOARD)
 GPIO.setup(RELAY_GPIO, GPIO.OUT)
 GPIO.output(RELAY_GPIO, GPIO.LOW)
 
-# ---------------- CSV File ----------------
-ACCESS_CSV = "access_log.csv"
+# ---------------- LOG FILE ----------------
+LOG_FILE = "access_log.csv"
+log_mutex = Lock()
 
-# ---------------- RFID Setup ----------------
-reader = SimpleMFRC522()
+def init_log():
+    """Create CSV if not exists or clear if older than 50 days"""
+    if not os.path.exists(LOG_FILE):
+        pd.DataFrame(columns=["Method","Identifier","Detected Timestamp","Open Timestamp","Close Timestamp"]).to_csv(LOG_FILE, index=False)
+    else:
+        last_modified = datetime.datetime.fromtimestamp(os.path.getmtime(LOG_FILE))
+        if (datetime.datetime.now() - last_modified).days >= 50:
+            pd.DataFrame(columns=["Method","Identifier","Detected Timestamp","Open Timestamp","Close Timestamp"]).to_csv(LOG_FILE, index=False)
 
-# ---------------- Load RFID Tags ----------------
-def load_registered_rfid_tags():
-    tags = {}
-    import sqlite3
-    conn = sqlite3.connect("rfid_tags.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS rfid_users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            rfid_id INTEGER UNIQUE,
-            name TEXT
-        )
-    """)
-    cursor.execute("SELECT rfid_id, name FROM rfid_users")
-    rows = cursor.fetchall()
-    for rfid_id, name in rows:
-        tags[int(rfid_id)] = name
-    conn.close()
-    return tags
+init_log()
 
-rfid_tags = load_registered_rfid_tags()
+def log_detect(method, identifier):
+    with log_mutex:
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        df_new = pd.DataFrame([[method, identifier, now, "", ""]],
+                              columns=["Method","Identifier","Detected Timestamp","Open Timestamp","Close Timestamp"])
+        df_new.to_csv(LOG_FILE, mode="a", header=False, index=False)
+        print(f"ℹ️ {now} | {method} | {identifier} | DETECTED")
+        return now
 
-# ---------------- CSV Logging ----------------
-csv_lock = Lock()
-def log_access(name, access_type, open_time="", close_time=""):
-    with csv_lock:
-        file_exists = os.path.exists(ACCESS_CSV)
-        with open(ACCESS_CSV, "a", newline="") as f:
-            writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow(["Name", "Type", "Open Timestamp", "Close Timestamp"])
-            writer.writerow([name, access_type, open_time, close_time])
+def log_open_close(method, identifier, open_time="", close_time=""):
+    with log_mutex:
+        df = pd.read_csv(LOG_FILE)
+        # Update last row without close time if exists
+        mask = (df["Method"]==method) & (df["Identifier"]==identifier) & (df["Open Timestamp"]!="" ) & (df["Close Timestamp"]=="")
+        if open_time and mask.any():
+            idx = df[mask].index[-1]
+            df.at[idx,"Open Timestamp"] = open_time
+        elif open_time:
+            df_new = pd.DataFrame([[method, identifier, "", open_time, ""]],
+                                  columns=["Method","Identifier","Detected Timestamp","Open Timestamp","Close Timestamp"])
+            df_new.to_csv(LOG_FILE, mode="a", header=False, index=False)
+        if close_time and mask.any():
+            idx = df[mask].index[-1]
+            df.at[idx,"Close Timestamp"] = close_time
+        df.to_csv(LOG_FILE, index=False)
 
-# ---------------- Face Recognition Setup ----------------
+# ---------------- DLIB SETUP ----------------
 detector = dlib.get_frontal_face_detector()
 predictor = dlib.shape_predictor('data/data_dlib/shape_predictor_68_face_landmarks.dat')
 face_reco_model = dlib.face_recognition_model_v1("data/data_dlib/dlib_face_recognition_resnet_model_v1.dat")
 
-# ---------------- Access System ----------------
-class AccessSystem:
-    def __init__(self):
-        # Face DB
-        self.face_features_known_list = []
-        self.face_name_known_list = []
-        self.load_face_database()
+# Load known face database
+def load_face_db():
+    names, features = [], []
+    if os.path.exists("data/features_all.csv"):
+        df = pd.read_csv("data/features_all.csv", header=None)
+        for i in range(df.shape[0]):
+            names.append(df.iloc[i][0])
+            features.append([df.iloc[i][j] for j in range(1,129)])
+    return names, features
 
-        # Lock state
-        self.lock_open = False
-        self.current_user = None
-        self.lock_open_start_time = 0
-        self.lock_duration = 10       # Lock stays open 15s
-        self.cooldown_seconds = 10    # Wait 10s after closing
-        self.last_close_time = 0
+known_names, known_features = load_face_db()
 
-        # Video capture
-        self.cap = cv2.VideoCapture(0)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+def euclidean_distance(f1,f2):
+    return np.linalg.norm(np.array(f1)-np.array(f2))
 
-        # Thread-safe lock
-        self.state_lock = Lock()
+# ---------------- LOCK STATE ----------------
+lock_open = False
+current_opener = None
+last_action_time = 0
+ignore_time = 10  # seconds
 
-    def load_face_database(self):
-        if os.path.exists("data/features_all.csv"):
-            csv_rd = pd.read_csv("data/features_all.csv", header=None)
-            for i in range(csv_rd.shape[0]):
-                features = [csv_rd.iloc[i][j] for j in range(1, 129)]
-                self.face_name_known_list.append(csv_rd.iloc[i][0])
-                self.face_features_known_list.append(features)
+def open_lock(method, identifier):
+    global lock_open, current_opener, last_action_time
+    if not lock_open:
+        GPIO.output(RELAY_GPIO, GPIO.HIGH)
+        lock_open = True
+        current_opener = f"{method}:{identifier}"
+        last_action_time = time.time()
+        log_open_close(method, identifier, open_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        print(f"🔓 Lock opened by {method}:{identifier}")
 
-    def euclidean_distance(self, f1, f2):
-        return np.linalg.norm(np.array(f1) - np.array(f2))
+def close_lock():
+    global lock_open, current_opener
+    if lock_open and time.time()-last_action_time>=ignore_time:
+        method, identifier = current_opener.split(":",1)
+        GPIO.output(RELAY_GPIO, GPIO.LOW)
+        log_open_close(method, identifier, close_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        print(f"🔒 Lock closed by {method}:{identifier}")
+        lock_open = False
+        current_opener = None
 
-    # ---------- Face Processing ----------
-    def process_face(self):
-        while True:
-            ret, frame = self.cap.read()
-            if not ret:
-                continue
+# ---------------- RESTORE LOCK ON START ----------------
+if os.path.exists(LOG_FILE):
+    df = pd.read_csv(LOG_FILE)
+    if not df.empty:
+        last_open = df[df["Close Timestamp"]==""]
+        if not last_open.empty:
+            last_row = last_open.iloc[-1]
+            lock_open = True
+            current_opener = f"{last_row['Method']}:{last_row['Identifier']}"
+            GPIO.output(RELAY_GPIO, GPIO.HIGH)
+            print(f"🔓 Lock restored on startup by {current_opener}")
+        else:
+            GPIO.output(RELAY_GPIO, GPIO.LOW)
+            print("🔒 Lock CLOSED on startup")
+else:
+    GPIO.output(RELAY_GPIO, GPIO.LOW)
+    print("🔒 Lock CLOSED on startup")
 
-            faces = detector(frame, 0)
-            now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+# ---------------- FACE THREAD ----------------
+def face_thread():
+    global lock_open, current_opener, last_action_time
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,320)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT,240)
+    font = cv2.FONT_HERSHEY_SIMPLEX
 
-            detected_names = []
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        faces = detector(frame,0)
+        for face in faces:
+            shape = predictor(frame, face)
+            feature = face_reco_model.compute_face_descriptor(frame, shape)
+            name = "Unknown"
+            if known_features:
+                distances = [euclidean_distance(feature,f) for f in known_features]
+                if min(distances)<0.6:
+                    name = known_names[distances.index(min(distances))]
+            log_detect("FACE", name)
+            # open only if lock is closed
+            if not lock_open:
+                if name!="Unknown":
+                    open_lock("FACE", name)
+            elif current_opener=="FACE:"+name:
+                close_lock()
+        time.sleep(0.05)
 
-            for face in faces:
-                shape = predictor(frame, face)
-                face_feature = face_reco_model.compute_face_descriptor(frame, shape)
-                distances = [self.euclidean_distance(face_feature, f) for f in self.face_features_known_list]
+# ---------------- RFID THREAD ----------------
+reader = SimpleMFRC522()
+rfid_tags = {}  # tag_id:int -> Name:str
 
-                if distances and min(distances) < 0.6:
-                    name = self.face_name_known_list[distances.index(min(distances))]
-                    detected_names.append(name)
+def init_rfid_db():
+    conn = sqlite3.connect('rfid_data.db')
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS rfid_users (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        tag_id TEXT UNIQUE,
+                        name TEXT)''')
+    conn.commit()
+    # load into dictionary
+    cursor.execute("SELECT tag_id,name FROM rfid_users")
+    for tag_id, name in cursor.fetchall():
+        rfid_tags[int(tag_id)] = name
+    conn.close()
 
-                    cv2.rectangle(frame, (face.left(), face.top()), (face.right(), face.bottom()), (255, 255, 255), 2)
-                    cv2.putText(frame, name, (face.left(), face.top()-10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+init_rfid_db()
 
-                    with self.state_lock:
-                        # Open only if closed + cooldown passed
-                        if (not self.lock_open) and (time.time() - self.last_close_time >= self.cooldown_seconds):
-                            GPIO.output(RELAY_GPIO, GPIO.HIGH)
-                            self.lock_open = True
-                            self.current_user = name
-                            self.lock_open_start_time = time.time()
-                            print(f"🔓 Lock opened by {name} (Face)")
-                            log_access(name, "Face", open_time=now_str)
+def register_rfid(tag_id):
+    conn = sqlite3.connect('rfid_data.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM rfid_users WHERE tag_id=?",(str(tag_id),))
+    res = cursor.fetchone()
+    if res:
+        name = res[0]
+    else:
+        name = input(f"Enter name for new RFID tag {tag_id}: ").strip()
+        cursor.execute("INSERT INTO rfid_users(tag_id,name) VALUES (?,?)",(str(tag_id),name))
+        conn.commit()
+        rfid_tags[int(tag_id)] = name
+    conn.close()
+    return name
 
-                        # If lock already open by another user → just log
-                        elif self.lock_open and name != self.current_user:
-                            log_access(name, "Face", open_time=now_str)
+def rfid_thread():
+    global lock_open, current_opener, last_action_time
+    while True:
+        uid, _ = reader.read_no_block()
+        if uid:
+            if uid not in rfid_tags:
+                name = register_rfid(uid)
+            else:
+                name = rfid_tags[uid]
+            log_detect("RFID", f"{name}({uid})")
+            if not lock_open:
+                open_lock("RFID", f"{name}({uid})")
+            elif current_opener==f"RFID:{name}({uid})":
+                close_lock()
+        time.sleep(0.1)
 
-                else:
-                    # Unknown face → log only
-                    cv2.rectangle(frame, (face.left(), face.top()), (face.right(), face.bottom()), (0,0,255),2)
-                    cv2.putText(frame, "Unknown", (face.left(), face.top()-10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255),1)
-                    log_access("Unknown", "Face", open_time=now_str)
-
-            # Automatic lock close after 15s if opener still present
-            with self.state_lock:
-                if self.lock_open and time.time() - self.lock_open_start_time >= self.lock_duration:
-                    if self.current_user in detected_names:
-                        GPIO.output(RELAY_GPIO, GPIO.LOW)
-                        now_close_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        print(f"🔒 Lock closed by {self.current_user}")
-                        log_access(self.current_user, "Face", close_time=now_close_str)
-                        self.lock_open = False
-                        self.current_user = None
-                        self.last_close_time = time.time()
-                    else:
-                        # Reset timer if opener not seen
-                        self.lock_open_start_time = time.time()
-
-            cv2.imshow("Access System", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-
-            time.sleep(0.05)
-
-    # ---------- RFID Processing ----------
-    def process_rfid(self):
-        while True:
-            try:
-                rfid_id, text = reader.read_no_block()
-            except:
-                rfid_id = None
-
-            now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            if rfid_id:
-                with self.state_lock:
-                    if rfid_id in rfid_tags:
-                        tag_name = rfid_tags[rfid_id]
-
-                        # Open only if closed + cooldown passed
-                        if (not self.lock_open) and (time.time() - self.last_close_time >= self.cooldown_seconds):
-                            GPIO.output(RELAY_GPIO, GPIO.HIGH)
-                            self.lock_open = True
-                            self.current_user = tag_name
-                            self.lock_open_start_time = time.time()
-                            print(f"🔓 Lock opened by {tag_name} (RFID)")
-                            log_access(tag_name, "RFID", open_time=now_str)
-
-                        # If lock already open by another user → just log
-                        elif self.lock_open and tag_name != self.current_user:
-                            log_access(tag_name, "RFID", open_time=now_str)
-
-                    else:
-                        # Unknown RFID → log only
-                        print(f"❌ Unknown RFID tag: {rfid_id}")
-                        log_access("Unknown", "RFID", open_time=now_str)
-
-            # Automatic close (same logic as face)
-            with self.state_lock:
-                if self.lock_open and time.time() - self.lock_open_start_time >= self.lock_duration:
-                    if self.current_user == rfid_tags.get(rfid_id, None):
-                        GPIO.output(RELAY_GPIO, GPIO.LOW)
-                        now_close_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        print(f"🔒 Lock closed by {self.current_user}")
-                        log_access(self.current_user, "RFID", close_time=now_close_str)
-                        self.lock_open = False
-                        self.current_user = None
-                        self.last_close_time = time.time()
-                    else:
-                        # Reset timer if opener not seen
-                        self.lock_open_start_time = time.time()
-
-            time.sleep(0.1)
-
-    # ---------- Run System ----------
-    def run(self):
-        t1 = Thread(target=self.process_face)
-        t2 = Thread(target=self.process_rfid)
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
-
-if __name__ == "__main__":
-    print("🔑 Access System Running...")
-    system = AccessSystem()
-    system.run()
+# ---------------- MAIN ----------------
+if __name__=="__main__":
+    try:
+        t_face = Thread(target=face_thread)
+        t_rfid = Thread(target=rfid_thread)
+        t_face.start()
+        t_rfid.start()
+        t_face.join()
+        t_rfid.join()
+    except KeyboardInterrupt:
+        print("Exiting...")
+    finally:
+        GPIO.output(RELAY_GPIO, GPIO.LOW)
+        GPIO.cleanup()
