@@ -1,6 +1,6 @@
-`#!/usr/bin/env python3
-# sentinel_gui.py
-# Full integrated Sentinel Smart Lock GUI + RFID + Face recognition
+import sys
+import os
+sys.path.insert(0, os.path.abspath("/home/project/Desktop/Att/lib"))
 
 import os
 import sys
@@ -519,6 +519,13 @@ class SentinelGUI:
 
         # Re-check every 2 seconds
         self.root.after(2000, self.check_add_user_close)
+
+    def check_add_user_timeout(self):
+        if gui_state.get("add_user_active"):
+            if time.time() - float(gui_state.get("last_user_activity", 0)) > ADD_USER_TIMEOUT:
+                gui_state["add_user_active"] = False
+                print("Add user timed out; returning to main screen")
+        self.root.after(5000, self.check_add_user_timeout)
 
 
     def on_close(self):
