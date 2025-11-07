@@ -17,26 +17,30 @@ def run_module(path, name):
     """Run a module and return to main system after it exits"""
     try:
         proc = subprocess.Popen(["python3", path])
-        proc.wait()  # Wait until module exits
+        proc.wait()
+        # Only return to main system if this launcher is still running
+        subprocess.Popen(["python3", MAIN_PY_PATH])
     except Exception as e:
         messagebox.showerror("Error", f"Failed to launch {name}:\n{e}")
 
-# ------------------------ GUI ------------------------
+# ------------------------ LAUNCHER APP ------------------------
 class LauncherApp:
     def __init__(self, root):
         self.root = root
         self.root.title("🔒 Sentinel Smart Lock Launcher")
         self.root.configure(bg="#1E1E2E")
 
-        # Start in fullscreen
+        # Fullscreen
         self.fullscreen = True
         self.root.attributes("-fullscreen", True)
         self.root.focus_force()
         self.root.bind("<Escape>", self.toggle_fullscreen)
 
+        # Main frame
         self.frame = tk.Frame(root, bg="#1E1E2E")
         self.frame.pack(expand=True, fill="both")
 
+        # Password screen first
         self.password_screen()
 
         # Start auto-return timer
@@ -46,6 +50,7 @@ class LauncherApp:
         self.fullscreen = not self.fullscreen
         self.root.attributes("-fullscreen", self.fullscreen)
 
+    # ---------------- PASSWORD SCREEN ----------------
     def password_screen(self):
         for widget in self.frame.winfo_children():
             widget.destroy()
@@ -74,6 +79,7 @@ class LauncherApp:
         else:
             messagebox.showerror("Access Denied", "Incorrect Password!")
 
+    # ---------------- MAIN BUTTONS ----------------
     def show_main_buttons(self):
         for widget in self.frame.winfo_children():
             widget.destroy()
@@ -81,7 +87,7 @@ class LauncherApp:
         tk.Label(self.frame, text="Choose Module to Launch", font=("Helvetica", 20, "bold"),
                  fg="#FFD369", bg="#1E1E2E").pack(pady=(40,20))
 
-        # Base button style
+        # Base button style (no bg/activebackground)
         button_style = {
             "font": ("Arial", 16, "bold"),
             "fg": "white",
@@ -114,22 +120,23 @@ class LauncherApp:
                   command=self.terminate_and_go_main,
                   bg="#FF4444", activebackground="#CC0000", **button_style).pack(pady=10)
 
-        # Reset auto-return timer whenever user interacts
+        # Reset auto-return timer on any interaction
         self.frame.bind_all("<Button-1>", self.reset_timer)
         self.frame.bind_all("<Key>", self.reset_timer)
 
+    # ---------------- RETURN HOME ----------------
     def return_home(self, event=None):
-        """Return to main smart lock GUI"""
         self.root.destroy()
         subprocess.Popen(["python3", MAIN_PY_PATH])
 
+    # ---------------- TERMINATE & GO 1.PY ----------------
     def terminate_and_go_main(self):
-        """Terminate this launcher and open 1.py"""
         self.root.destroy()
         subprocess.Popen(["python3", MAIN_PY_PATH])
+        # Do not start any auto-return again
 
+    # ---------------- AUTO RETURN ----------------
     def reset_timer(self, event=None):
-        """Reset auto-return timer on user interaction"""
         if self.auto_return_id:
             self.root.after_cancel(self.auto_return_id)
         self.auto_return_id = self.root.after(AUTO_RETURN_TIME * 1000, self.return_home)
