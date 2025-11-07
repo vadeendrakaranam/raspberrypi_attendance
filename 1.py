@@ -1,91 +1,53 @@
 #!/usr/bin/env python3
-# Fullscreen Smart Lock Launcher with Password + Auto Return
+# Fullscreen RFID Tag Manager
 
 import tkinter as tk
-from tkinter import messagebox
-import subprocess
+from tkinter import simpledialog, messagebox
+import sqlite3
+from mfrc522 import SimpleMFRC522
+import os
 
-# ------------------------ PATHS ------------------------
-MAIN_PY_PATH = "/home/project/Desktop/Att/1.py"
-RFID_PY_PATH = "/home/project/Desktop/Att/rfid.py"
-FACE_PY_PATH = "/home/project/Desktop/Att/face.py"
+# ---------------- Database Setup ----------------
+DB_PATH = os.path.expanduser("~/Desktop/Att/rfid_data.db")
+conn = sqlite3.connect(DB_PATH)
+c = conn.cursor()
+c.execute("""
+    CREATE TABLE IF NOT EXISTS rfid_users (
+        tag_id TEXT PRIMARY KEY,
+        name TEXT
+    )
+""")
+conn.commit()
 
-# ------------------------ MODULE LAUNCHERS ------------------------
-def run_module_and_return(path, name, launcher_root):
-    """Run a module and return to main system after it exits"""
-    try:
-        proc = subprocess.Popen(["python3", path])
-        launcher_root.withdraw()  # Hide launcher while module runs
-        proc.wait()  # Wait until module exits
-        launcher_root.destroy()  # Close launcher
-        subprocess.Popen(["python3", MAIN_PY_PATH])  # Start main system
-    except Exception as e:
-        messagebox.showerror("Error", f"Failed to launch {name}:\n{e}")
+# ---------------- RFID Reader ----------------
+reader = SimpleMFRC522()
 
-# ------------------------ GUI ------------------------
-class LauncherApp:
+# ---------------- Tkinter GUI ----------------
+class RFIDManager:
     def __init__(self, root):
         self.root = root
-        self.root.title("🔒 Sentinel Smart Lock Launcher")
+        self.root.title("RFID Tag Manager")
         self.root.configure(bg="#1E1E2E")
-
-        # Start in fullscreen
+        
+        # Fullscreen setup
         self.fullscreen = True
         self.root.attributes("-fullscreen", True)
         self.root.focus_force()
-        # Toggle fullscreen with ESC
         self.root.bind("<Escape>", self.toggle_fullscreen)
 
         # Frame container
         self.frame = tk.Frame(root, bg="#1E1E2E")
         self.frame.pack(expand=True, fill="both")
 
-        # Password screen
-        self.password_screen()
+        self.setup_ui()
 
     def toggle_fullscreen(self, event=None):
-        """Toggle fullscreen on ESC key"""
         self.fullscreen = not self.fullscreen
         self.root.attributes("-fullscreen", self.fullscreen)
 
-    def password_screen(self):
-        """Display password entry screen"""
-        # Clear frame
-        for widget in self.frame.winfo_children():
-            widget.destroy()
-
-        tk.Label(self.frame, text="Sentinel Smart Lock", font=("Helvetica", 24, "bold"),
-                 fg="#FFD369", bg="#1E1E2E").pack(pady=(40,10))
-
-        tk.Label(self.frame, text="Enter Password to Continue", font=("Arial", 14),
-                 fg="#BBBBBB", bg="#1E1E2E").pack(pady=(0,20))
-
-        self.password_var = tk.StringVar()
-        self.password_entry = tk.Entry(self.frame, textvariable=self.password_var,
-                                       font=("Arial", 16), show="*", width=20)
-        self.password_entry.pack(pady=10)
-        self.password_entry.focus_set()
-
-        tk.Button(self.frame, text="SUBMIT", font=("Arial", 14, "bold"), bg="#4ECCA3",
-                  fg="white", activebackground="#45B38F", activeforeground="white",
-                  width=15, height=2, relief="flat", command=self.check_password).pack(pady=20)
-
-        tk.Label(self.frame, text="Developed by Vadeendra Karanam",
-                 font=("Helvetica", 12), fg="#9FB9BE", bg="#1E1E2E").pack(side="bottom", pady=20)
-
-    def check_password(self):
-        if self.password_var.get() == "1234":
-            self.show_main_buttons()
-        else:
-            messagebox.showerror("Access Denied", "Incorrect Password!")
-
-    def show_main_buttons(self):
-        """Display module selection buttons"""
-        # Clear frame
-        for widget in self.frame.winfo_children():
-            widget.destroy()
-
-        tk.Label(self.frame, text="Choose Module to Launch", font=("Helvetica", 20, "bold"),
+    def setup_ui(self):
+        # Title
+        tk.Label(self.frame, text="RFID Tag Manager", font=("Helvetica", 24, "bold"),
                  fg="#FFD369", bg="#1E1E2E").pack(pady=(40,20))
 
         button_style = {
@@ -101,20 +63,94 @@ class LauncherApp:
             "cursor": "hand2",
         }
 
-        tk.Button(self.frame, text="🔑 RFID MODULE",
-                  command=lambda: run_module_and_return(RFID_PY_PATH, "RFID Module", self.root),
-                  **button_style).pack(pady=15)
+        tk.Button(self.frame, text="Add Tag", command=self.add_tag, **button_style).pack(pady=10)
+        tk.Button(self.frame, text="Update Tag", command=self.update_tag, **button_style).pack(pady=10)
+        tk.Button(self.frame, text="Delete Tag", command=self.delete_tag_popup, **button_style).pack(pady=10)
+        tk.Button(self.frame, text="Show All Tags", command=self.show_all_tags, **button_style).pack(pady=10)
+        tk.Button(self.frame, text="Close", command=self.close_app, **button_style, bg="#FF5555", activebackground="#E04747").pack(pady=20)
 
-        tk.Button(self.frame, text="👁 FACE RECOGNITION",
-                  command=lambda: run_module_and_return(FACE_PY_PATH, "Face Recognition", self.root),
-                  **button_style).pack(pady=15)
+    # ---------------- Tag Operations ----------------
+    def add_tag(self):
+        messagebox.showinfo("Info", "Scan new RFID tag...")
+        try:
+            uid, _ = reader.read()
+            uid = str(uid)
+            c.execute("SELECT name FROM rfid_users WHERE tag_id=?", (uid,))
+            row = c.fetchone()
+            if row:
+                messagebox.showinfo("Info", f"Tag already exists:\nUID: {uid}\nName: {row[0]}")
+            else:
+                name = simpledialog.askstring("Add Tag", "Enter name for this tag:")
+                if name:
+                    c.execute("INSERT INTO rfid_users(tag_id, name) VALUES(?, ?)", (uid, name))
+                    conn.commit()
+                    messagebox.showinfo("Success", f"Tag '{name}' added with UID {uid}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
 
-        tk.Button(self.frame, text="⏹ MAIN SYSTEM",
-                  command=lambda: run_module_and_return(MAIN_PY_PATH, "Main System", self.root),
-                  **button_style, bg="#FF5555", activebackground="#E04747").pack(pady=25)
+    def update_tag(self):
+        messagebox.showinfo("Info", "Scan RFID tag to update...")
+        try:
+            uid, _ = reader.read()
+            uid = str(uid)
+            c.execute("SELECT name FROM rfid_users WHERE tag_id=?", (uid,))
+            row = c.fetchone()
+            if row:
+                new_name = simpledialog.askstring("Update Tag", f"Current name: {row[0]}\nEnter new name:")
+                if new_name:
+                    c.execute("UPDATE rfid_users SET name=? WHERE tag_id=?", (new_name, uid))
+                    conn.commit()
+                    messagebox.showinfo("Success", f"Tag updated to '{new_name}'")
+            else:
+                messagebox.showwarning("Unknown Card", f"Tag UID {uid} not found!")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
 
-# ------------------------ START APP ------------------------
+    def show_all_tags(self):
+        c.execute("SELECT tag_id, name FROM rfid_users")
+        rows = c.fetchall()
+        if not rows:
+            messagebox.showinfo("All Tags", "No tags stored.")
+            return
+        info = "\n".join([f"{name} ({tag_id})" for tag_id, name in rows])
+        messagebox.showinfo("All Tags", info)
+
+    def delete_tag_popup(self):
+        popup = tk.Toplevel(self.root)
+        popup.title("Delete Tags")
+        popup.geometry("400x400")
+        popup.configure(bg="#1E1E2E")
+
+        c.execute("SELECT tag_id, name FROM rfid_users")
+        rows = c.fetchall()
+
+        if not rows:
+            tk.Label(popup, text="No tags stored.", fg="white", bg="#1E1E2E", font=("Arial",14)).pack(pady=20)
+            return
+
+        for tag_id, name in rows:
+            frame = tk.Frame(popup, bg="#1E1E2E")
+            frame.pack(fill="x", pady=2, padx=5)
+            tk.Label(frame, text=f"{name} ({tag_id})", anchor="w", fg="white", bg="#1E1E2E", font=("Arial",12)).pack(side="left")
+            tk.Button(frame, text="Delete", command=lambda t=tag_id, n=name: self.delete_tag_confirm(t, n, popup),
+                      bg="#FF5555", fg="white", activebackground="#E04747", width=10).pack(side="right", padx=5)
+
+    def delete_tag_confirm(self, tag_id, name, popup):
+        confirm = messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete tag '{name}'?")
+        if confirm:
+            c.execute("DELETE FROM rfid_users WHERE tag_id=?", (tag_id,))
+            conn.commit()
+            messagebox.showinfo("Deleted", f"Tag '{name}' deleted successfully")
+            popup.destroy()
+            self.delete_tag_popup()  # refresh pop-up
+
+    def close_app(self):
+        conn.close()
+        self.root.destroy()
+
+
+# ------------------------ START ------------------------
 if __name__ == "__main__":
     root = tk.Tk()
-    app = LauncherApp(root)
+    app = RFIDManager(root)
     root.mainloop()
