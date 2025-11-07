@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Fullscreen Smart Lock Launcher with Password + Auto Return
+
 import tkinter as tk
 from tkinter import messagebox
 import subprocess
@@ -12,77 +14,74 @@ AUTO_RETURN_TIME = 120  # 2 minutes
 
 # ------------------------ MODULE LAUNCHERS ------------------------
 def run_module(path, name):
-    """Run a module and wait until it exits"""
+    """Run a module and return to main system after it exits"""
     try:
-        subprocess.Popen(["python3", path])
+        proc = subprocess.Popen(["python3", path])
+        proc.wait()  # Wait until module exits
     except Exception as e:
         messagebox.showerror("Error", f"Failed to launch {name}:\n{e}")
 
-# ------------------------ LAUNCHER GUI ------------------------
+# ------------------------ GUI ------------------------
 class LauncherApp:
     def __init__(self, root):
         self.root = root
         self.root.title("🔒 Sentinel Smart Lock Launcher")
         self.root.configure(bg="#1E1E2E")
 
-        # Fullscreen setup
+        # Start in fullscreen
         self.fullscreen = True
         self.root.attributes("-fullscreen", True)
         self.root.focus_force()
         self.root.bind("<Escape>", self.toggle_fullscreen)
 
-        # Main container frame
         self.frame = tk.Frame(root, bg="#1E1E2E")
-        self.frame.pack(expand=True, fill="both", padx=50, pady=50)
+        self.frame.pack(expand=True, fill="both")
 
-        # Start in password screen
         self.password_screen()
 
-        # Auto-return timer
+        # Start auto-return timer
         self.auto_return_id = self.root.after(AUTO_RETURN_TIME * 1000, self.return_home)
 
     def toggle_fullscreen(self, event=None):
         self.fullscreen = not self.fullscreen
         self.root.attributes("-fullscreen", self.fullscreen)
 
-    # ------------------------ PASSWORD SCREEN ------------------------
     def password_screen(self):
         for widget in self.frame.winfo_children():
             widget.destroy()
 
-        tk.Label(self.frame, text="Sentinel Smart Lock", font=("Helvetica", 28, "bold"),
-                 fg="#FFD369", bg="#1E1E2E").pack(pady=(20,10))
-        tk.Label(self.frame, text="Enter Password to Continue", font=("Arial", 16),
+        tk.Label(self.frame, text="Sentinel Smart Lock", font=("Helvetica", 24, "bold"),
+                 fg="#FFD369", bg="#1E1E2E").pack(pady=(40,10))
+        tk.Label(self.frame, text="Enter Password to Continue", font=("Arial", 14),
                  fg="#BBBBBB", bg="#1E1E2E").pack(pady=(0,20))
 
         self.password_var = tk.StringVar()
         self.password_entry = tk.Entry(self.frame, textvariable=self.password_var,
-                                       font=("Arial", 16), show="*", width=25)
+                                       font=("Arial", 16), show="*", width=20)
         self.password_entry.pack(pady=10)
         self.password_entry.focus_set()
 
-        tk.Button(self.frame, text="SUBMIT", font=("Arial", 16, "bold"), bg="#4ECCA3",
+        tk.Button(self.frame, text="SUBMIT", font=("Arial", 14, "bold"), bg="#4ECCA3",
                   fg="white", activebackground="#45B38F", activeforeground="white",
-                  width=20, height=2, relief="flat", command=self.check_password).pack(pady=20)
+                  width=15, height=2, relief="flat", command=self.check_password).pack(pady=20)
 
         tk.Label(self.frame, text="Developed by Vadeendra Karanam",
                  font=("Helvetica", 12), fg="#9FB9BE", bg="#1E1E2E").pack(side="bottom", pady=20)
 
-    # ------------------------ PASSWORD CHECK ------------------------
     def check_password(self):
         if self.password_var.get() == "1234":
             self.show_main_buttons()
         else:
             messagebox.showerror("Access Denied", "Incorrect Password!")
 
-    # ------------------------ MAIN BUTTONS ------------------------
     def show_main_buttons(self):
         for widget in self.frame.winfo_children():
             widget.destroy()
 
-        tk.Label(self.frame, text="Choose Module to Launch", font=("Helvetica", 22, "bold"),
-                 fg="#FFD369", bg="#1E1E2E").pack(pady=(10,30))
+        tk.Label(self.frame, text="Choose Module to Launch", font=("Helvetica", 20, "bold"),
+                 fg="#FFD369", bg="#1E1E2E").pack(pady=(40,20))
 
+        # Base button style
         button_style = {
             "font": ("Arial", 16, "bold"),
             "fg": "white",
@@ -115,22 +114,22 @@ class LauncherApp:
                   command=self.terminate_and_go_main,
                   bg="#FF4444", activebackground="#CC0000", **button_style).pack(pady=10)
 
-        # Reset auto-return on user interaction
+        # Reset auto-return timer whenever user interacts
         self.frame.bind_all("<Button-1>", self.reset_timer)
         self.frame.bind_all("<Key>", self.reset_timer)
 
-    # ------------------------ AUTO RETURN ------------------------
     def return_home(self, event=None):
         """Return to main smart lock GUI"""
         self.root.destroy()
         subprocess.Popen(["python3", MAIN_PY_PATH])
 
     def terminate_and_go_main(self):
-        """Terminate launcher and go to 1.py immediately"""
+        """Terminate this launcher and open 1.py"""
         self.root.destroy()
         subprocess.Popen(["python3", MAIN_PY_PATH])
 
     def reset_timer(self, event=None):
+        """Reset auto-return timer on user interaction"""
         if self.auto_return_id:
             self.root.after_cancel(self.auto_return_id)
         self.auto_return_id = self.root.after(AUTO_RETURN_TIME * 1000, self.return_home)
