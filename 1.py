@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Fullscreen Smart Lock Launcher with Password
+
 import tkinter as tk
 from tkinter import messagebox
 import subprocess
@@ -9,113 +11,100 @@ MAIN_PY_PATH = "/home/project/Desktop/Att/1.py"
 RFID_PY_PATH = "/home/project/Desktop/Att/rfid.py"
 FACE_PY_PATH = "/home/project/Desktop/Att/face.py"
 
+# ------------------------ MODULE LAUNCHERS ------------------------
+def run_module(path, name):
+    try:
+        subprocess.Popen(["python3", path])
+        messagebox.showinfo(f"{name}", f"{name} launched successfully!")
+    except Exception as e:
+        messagebox.showerror("Error", f"Failed to launch {name}:\n{e}")
+
 # ------------------------ GUI ------------------------
-class LauncherGUI:
+class LauncherApp:
     def __init__(self, root):
         self.root = root
         self.root.title("🔒 Sentinel Smart Lock Launcher")
-        self.root.attributes("-fullscreen", True)
         self.root.configure(bg="#1E1E2E")
 
-        self.correct_password = "1234"
+        # Force fullscreen immediately
+        root.update_idletasks()
+        root.deiconify()
+        root.attributes("-fullscreen", True)
+        root.focus_force()
 
-        self.build_password_screen()
+        # Optional: Escape to exit fullscreen
+        root.bind("<Escape>", lambda e: root.attributes("-fullscreen", False))
 
-    # ---------------- PASSWORD SCREEN ----------------
-    def build_password_screen(self):
-        self.clear_root()
+        # ------------------------ Frames ------------------------
+        self.frame = tk.Frame(root, bg="#1E1E2E")
+        self.frame.pack(expand=True)
 
-        tk.Label(
-            self.root,
-            text="Sentinel Smart Lock",
-            font=("Helvetica", 24, "bold"),
-            fg="#FFD369",
-            bg="#1E1E2E",
-        ).pack(pady=40)
+        # Title
+        tk.Label(self.frame, text="Sentinel Smart Lock", font=("Helvetica", 24, "bold"),
+                 fg="#FFD369", bg="#1E1E2E").pack(pady=(40,10))
 
-        tk.Label(
-            self.root,
-            text="Enter Password",
-            font=("Arial", 16),
-            fg="#BBBBBB",
-            bg="#1E1E2E",
-        ).pack(pady=10)
+        # Subtitle
+        tk.Label(self.frame, text="Enter Password to Continue", font=("Arial", 14),
+                 fg="#BBBBBB", bg="#1E1E2E").pack(pady=(0,20))
 
-        self.password_entry = tk.Entry(self.root, show="*", font=("Arial", 16), width=15)
+        # Password Entry
+        self.password_var = tk.StringVar()
+        self.password_entry = tk.Entry(self.frame, textvariable=self.password_var,
+                                       font=("Arial", 16), show="*", width=20)
         self.password_entry.pack(pady=10)
-        self.password_entry.focus()
+        self.password_entry.focus_set()
 
-        submit_btn = tk.Button(
-            self.root,
-            text="Submit",
-            font=("Arial", 14, "bold"),
-            bg="#4ECCA3",
-            fg="white",
-            activebackground="#45B38F",
-            width=15,
-            command=self.check_password
-        )
-        submit_btn.pack(pady=20)
+        # Submit Button
+        tk.Button(self.frame, text="SUBMIT", font=("Arial", 14, "bold"), bg="#4ECCA3",
+                  fg="white", activebackground="#45B38F", activeforeground="white",
+                  width=15, height=2, relief="flat", command=self.check_password).pack(pady=20)
 
-    # ---------------- CHECK PASSWORD ----------------
+        # Footer
+        tk.Label(self.frame, text="Developed by Vadeendra Karanam",
+                 font=("Helvetica", 12), fg="#9FB9BE", bg="#1E1E2E").pack(side="bottom", pady=20)
+
     def check_password(self):
-        if self.password_entry.get() == self.correct_password:
-            self.build_main_screen()
+        if self.password_var.get() == "1234":
+            self.show_main_buttons()
         else:
             messagebox.showerror("Access Denied", "Incorrect Password!")
-            self.password_entry.delete(0, tk.END)
 
-    # ---------------- MAIN SCREEN ----------------
-    def build_main_screen(self):
-        self.clear_root()
-
-        tk.Label(
-            self.root,
-            text="Sentinel Smart Lock",
-            font=("Helvetica", 24, "bold"),
-            fg="#FFD369",
-            bg="#1E1E2E",
-        ).pack(pady=20)
-
-        subtitle = tk.Label(
-            self.root,
-            text="Choose Module to Launch",
-            font=("Arial", 14),
-            fg="#BBBBBB",
-            bg="#1E1E2E",
-        )
-        subtitle.pack(pady=10)
-
-        # Button style
-        btn_style = {"font": ("Arial", 13, "bold"), "bg": "#4ECCA3", "fg": "white",
-                     "activebackground": "#45B38F", "width": 20, "height": 2}
-
-        tk.Button(self.root, text="🔑 RFID MODULE", command=self.run_rfid, **btn_style).pack(pady=10)
-        tk.Button(self.root, text="👁 FACE RECOGNITION", command=self.run_face, **btn_style).pack(pady=10)
-
-        tk.Button(self.root, text="⏹ CLOSE & RETURN", command=self.close_launcher,
-                  font=("Arial", 13, "bold"), bg="#FF5555", fg="white",
-                  activebackground="#E04747", width=20, height=2).pack(pady=15)
-
-    # ---------------- UTILITY ----------------
-    def clear_root(self):
-        for widget in self.root.winfo_children():
+    def show_main_buttons(self):
+        # Clear current frame
+        for widget in self.frame.winfo_children():
             widget.destroy()
 
-    def run_rfid(self):
-        subprocess.Popen(["python3", RFID_PY_PATH])
-        messagebox.showinfo("RFID Module", "RFID system launched successfully!")
+        # Title
+        tk.Label(self.frame, text="Choose Module to Launch", font=("Helvetica", 20, "bold"),
+                 fg="#FFD369", bg="#1E1E2E").pack(pady=(40,20))
 
-    def run_face(self):
-        subprocess.Popen(["python3", FACE_PY_PATH])
-        messagebox.showinfo("Face Module", "Face Recognition system launched successfully!")
+        button_style = {
+            "font": ("Arial", 16, "bold"),
+            "bg": "#4ECCA3",
+            "fg": "white",
+            "activebackground": "#45B38F",
+            "activeforeground": "white",
+            "relief": "flat",
+            "width": 20,
+            "height": 2,
+            "bd": 0,
+            "cursor": "hand2",
+        }
 
-    def close_launcher(self):
-        self.root.destroy()
-        subprocess.Popen(["python3", MAIN_PY_PATH])
+        tk.Button(self.frame, text="🔑 RFID MODULE",
+                  command=lambda: run_module(RFID_PY_PATH, "RFID Module"),
+                  **button_style).pack(pady=15)
 
-# ------------------------ RUN ------------------------
+        tk.Button(self.frame, text="👁 FACE RECOGNITION",
+                  command=lambda: run_module(FACE_PY_PATH, "Face Recognition"),
+                  **button_style).pack(pady=15)
+
+        tk.Button(self.frame, text="⏹ MAIN SYSTEM",
+                  command=lambda: run_module(MAIN_PY_PATH, "Main System"),
+                  **button_style, bg="#FF5555", activebackground="#E04747").pack(pady=25)
+
+# ------------------------ START APP ------------------------
 if __name__ == "__main__":
     root = tk.Tk()
-    app = LauncherGUI(root)
+    app = LauncherApp(root)
     root.mainloop()
