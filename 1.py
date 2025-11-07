@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
+# RFID Tag Manager GUI
+
 import tkinter as tk
 from tkinter import simpledialog, messagebox
 import sqlite3
 from mfrc522 import SimpleMFRC522
 import os
-import subprocess
 
 # ---------------- Database Setup ----------------
 DB_PATH = os.path.expanduser("~/Desktop/Att/rfid_data.db")
@@ -24,14 +25,13 @@ reader = SimpleMFRC522()
 # ---------------- Tkinter GUI ----------------
 root = tk.Tk()
 root.title("RFID Tag Manager")
+root.attributes("-fullscreen", True)  # Fullscreen
+root.configure(bg="#1E1E2E")
 
-# Fullscreen setup
-root.attributes("-fullscreen", True)
-root.focus_force()
+# Press ESC to exit fullscreen
 def toggle_fullscreen(event=None):
     root.attributes("-fullscreen", False)
 root.bind("<Escape>", toggle_fullscreen)
-root.configure(bg="#1E1E2E")
 
 # ---------------- Tag Operations ----------------
 def add_tag():
@@ -104,17 +104,17 @@ def delete_tag_confirm(tag_id, name, popup):
         conn.commit()
         messagebox.showinfo("Deleted", f"Tag '{name}' deleted successfully")
         popup.destroy()
-        delete_tag_popup()  # refresh pop-up
+        delete_tag_popup()  # refresh
 
 def close_app():
     conn.close()
     root.destroy()
-    # Redirect to main smart lock GUI
-    subprocess.Popen(["python3", "/home/project/Desktop/Att/1.py"])
+    # Automatically open main lock script
+    os.system("python3 /home/project/Desktop/Att/1.py &")
 
-# ---------------- Buttons ----------------
+# ---------------- Button Style ----------------
 button_style = {
-    "font": ("Arial", 16, "bold"),
+    "font": ("Arial", 14, "bold"),
     "bg": "#4ECCA3",
     "fg": "white",
     "activebackground": "#45B38F",
@@ -126,10 +126,17 @@ button_style = {
     "cursor": "hand2",
 }
 
-tk.Button(root, text="Add Tag", command=add_tag, **button_style).pack(pady=10)
-tk.Button(root, text="Update Tag", command=update_tag, **button_style).pack(pady=10)
-tk.Button(root, text="Delete Tag", command=delete_tag_popup, **button_style).pack(pady=10)
-tk.Button(root, text="Show All Tags", command=show_all_tags, **button_style).pack(pady=10)
-tk.Button(root, text="Close & Open Main Lock", command=close_app, bg="#FF5555", activebackground="#E04747", **button_style).pack(pady=20)
+# ---------------- Buttons ----------------
+tk.Button(root, text="Add Tag", command=add_tag, **button_style).pack(pady=8)
+tk.Button(root, text="Update Tag", command=update_tag, **button_style).pack(pady=8)
+tk.Button(root, text="Delete Tag", command=delete_tag_popup, **button_style).pack(pady=8)
+tk.Button(root, text="All Tags", command=show_all_tags, **button_style).pack(pady=8)
 
+# Special red close button
+close_btn_style = button_style.copy()
+close_btn_style["bg"] = "#FF5555"
+close_btn_style["activebackground"] = "#E04747"
+tk.Button(root, text="Close & Open Main Lock", command=close_app, **close_btn_style).pack(pady=20)
+
+# ---------------- Run GUI ----------------
 root.mainloop()
