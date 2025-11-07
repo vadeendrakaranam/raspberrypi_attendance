@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Fullscreen Sentinel Smart Lock Launcher with Embedded Authentication
+# Fullscreen Sentinel Smart Lock Launcher with Animated Authentication
 
 import tkinter as tk
 from tkinter import messagebox
@@ -88,51 +88,71 @@ subtitle.pack(pady=20)
 
 # ------------------------ PASSWORD ENTRY ------------------------
 password_var = tk.StringVar()
-
 password_entry = tk.Entry(root, textvariable=password_var, show="*", font=("Arial", 20))
 password_entry.pack(pady=20)
 password_entry.focus_set()
 
-def authenticate():
+password_button = tk.Button(root, text="🔒 Unlock", command=lambda: authenticate(animated=True), **button_style)
+password_button.pack(pady=10)
+
+# ------------------------ MODULE BUTTONS (HIDDEN INITIALLY) ------------------------
+buttons_frame = tk.Frame(root, bg="#1E1E2E")
+buttons = []
+
+def show_buttons():
+    rfid_btn = tk.Button(buttons_frame, text="🔑 RFID MODULE", command=run_rfid, **button_style)
+    rfid_btn.pack(pady=20)
+    face_btn = tk.Button(buttons_frame, text="👁 FACE RECOGNITION", command=run_face, **button_style)
+    face_btn.pack(pady=20)
+    close_btn = tk.Button(buttons_frame, text="⏹ CLOSE & RETURN", command=close_launcher, **button_style)
+    close_btn.config(bg="#FF5555", activebackground="#E04747")
+    close_btn.pack(pady=30)
+    buttons_frame.pack(pady=50)
+
+# ------------------------ AUTHENTICATION & ANIMATION ------------------------
+def authenticate(animated=False):
     if password_var.get() == "1234":
-        password_frame.pack_forget()
-        show_buttons()
+        if animated:
+            slide_up_password()
+        else:
+            password_entry.pack_forget()
+            password_button.pack_forget()
+            show_buttons()
     else:
         messagebox.showerror("Access Denied", "Incorrect Password!")
         password_var.set("")
         password_entry.focus_set()
 
-# ------------------------ AUTH FRAME ------------------------
-password_frame = tk.Frame(root, bg="#1E1E2E")
-password_frame.pack()
-password_frame.pack_propagate(False)
+def slide_up_password():
+    """Slide password entry and button up, then reveal buttons"""
+    # Get initial positions
+    entry_y = password_entry.winfo_y()
+    button_y = password_button.winfo_y()
+    step = 10  # pixels per frame
 
-password_button = tk.Button(password_frame, text="🔒 Unlock", command=authenticate, **button_style)
-password_button.pack(pady=10)
+    def animate():
+        nonlocal entry_y, button_y
+        entry_y -= step
+        button_y -= step
+        password_entry.place(y=entry_y)
+        password_button.place(y=button_y)
+        if button_y > -50:
+            root.after(15, animate)
+        else:
+            password_entry.destroy()
+            password_button.destroy()
+            show_buttons()
 
-# ------------------------ MODULE BUTTONS ------------------------
-buttons_frame = tk.Frame(root, bg="#1E1E2E")
-buttons_frame.pack(pady=50)
-
-def show_buttons():
-    # Clear password widgets
-    password_frame.pack_forget()
-    
-    # Buttons
-    rfid_btn = tk.Button(buttons_frame, text="🔑 RFID MODULE", command=run_rfid, **button_style)
-    rfid_btn.pack(pady=20)
-    
-    face_btn = tk.Button(buttons_frame, text="👁 FACE RECOGNITION", command=run_face, **button_style)
-    face_btn.pack(pady=20)
-    
-    close_btn = tk.Button(buttons_frame, text="⏹ CLOSE & RETURN", command=close_launcher, **button_style)
-    close_btn.config(bg="#FF5555", activebackground="#E04747")
-    close_btn.pack(pady=30)
+    # Convert pack to place for animation
+    password_entry.pack_forget()
+    password_button.pack_forget()
+    password_entry.place(x=root.winfo_width()//2 - 150, y=password_entry.winfo_y())
+    password_button.place(x=root.winfo_width()//2 - 100, y=password_button.winfo_y())
+    animate()
 
 # ------------------------ FOOTER ------------------------
 footer = tk.Label(root, text="Developed by Vadeendra Karanam",
                   font=("Helvetica", 16), bg="#1E1E2E", fg="#BBBBBB")
 footer.pack(side="bottom", pady=20)
 
-# ------------------------ RUN LOOP ------------------------
 root.mainloop()
