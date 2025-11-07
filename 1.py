@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-# launcher_gui.py — Sentinel Smart Lock Launcher (RFID / FACE)
+# Fullscreen Sentinel Smart Lock Launcher with Embedded Authentication
 
 import tkinter as tk
-from tkinter import simpledialog, messagebox
+from tkinter import messagebox
 import subprocess
 import os
 import signal
-import sys
 
+# ------------------------ PATHS ------------------------
 MAIN_PY_PATH = "/home/project/Desktop/Att/1.py"
 RFID_PY_PATH = "/home/project/Desktop/Att/rfid.py"
 FACE_PY_PATH = "/home/project/Desktop/Att/face.py"
 
-# ------------------------ Utility Functions ------------------------
-
+# ------------------------ UTILITIES ------------------------
 def kill_script(script_path):
     """Kill all running instances of a given script"""
     try:
@@ -29,126 +28,111 @@ def kill_script(script_path):
 def run_rfid():
     kill_script(MAIN_PY_PATH)
     subprocess.Popen(["python3", RFID_PY_PATH])
-    root.destroy()
+    messagebox.showinfo("RFID Module", "RFID system launched successfully!")
 
 def run_face():
     kill_script(MAIN_PY_PATH)
     subprocess.Popen(["python3", FACE_PY_PATH])
-    root.destroy()
+    messagebox.showinfo("Face Module", "Face Recognition system launched successfully!")
 
 def close_launcher():
     root.destroy()
     subprocess.Popen(["python3", MAIN_PY_PATH])
 
-# ------------------------ Password Prompt ------------------------
-root_pw = tk.Tk()
-root_pw.withdraw()  # hide small main window
-password = simpledialog.askstring("🔒 Password Required", "Enter Admin Password:", show="*")
-
-if password != "1234":
-    messagebox.showerror("Access Denied", "Incorrect Password!")
-    sys.exit(0)
-
-root_pw.destroy()
-
-# ------------------------ Main Launcher GUI ------------------------
+# ------------------------ GUI SETUP ------------------------
 root = tk.Tk()
-root.title("Sentinel Smart Lock — Launcher")
+root.title("🔒 Sentinel Smart Lock Launcher")
 root.attributes("-fullscreen", True)
+root.configure(bg="#1E1E2E")  # dark background
 
-# Colors & fonts
-BG_COLOR = "#081A2B"
-BTN_COLOR = "#1E7A6F"
-BTN_HOVER = "#289B84"
-TEXT_COLOR = "#A3FFD9"
-FOOTER_COLOR = "#99B7C2"
+# Fullscreen toggle with ESC
+fullscreen = True
+def toggle_fullscreen(event=None):
+    global fullscreen
+    fullscreen = not fullscreen
+    root.attributes("-fullscreen", fullscreen)
+root.bind("<Escape>", toggle_fullscreen)
 
-root.configure(bg=BG_COLOR)
+# ------------------------ STYLES ------------------------
+button_style = {
+    "font": ("Arial", 16, "bold"),
+    "bg": "#4ECCA3",
+    "fg": "white",
+    "activebackground": "#45B38F",
+    "activeforeground": "white",
+    "relief": "flat",
+    "width": 20,
+    "height": 2,
+    "bd": 0,
+    "cursor": "hand2",
+}
 
-# Header
-header = tk.Label(
+# ------------------------ LABELS ------------------------
+label = tk.Label(
     root,
-    text="🛡️ Sentinel Smart Lock",
-    font=("Helvetica", 42, "bold"),
-    bg=BG_COLOR,
-    fg="#7BE0E0"
+    text="Sentinel Smart Lock",
+    font=("Helvetica", 40, "bold"),
+    fg="#FFD369",
+    bg="#1E1E2E",
 )
-header.pack(pady=(60, 20))
+label.pack(pady=50)
 
-sub_header = tk.Label(
+subtitle = tk.Label(
     root,
-    text="Launcher Dashboard",
-    font=("Helvetica", 24),
-    bg=BG_COLOR,
-    fg=TEXT_COLOR
+    text="Enter Password to Continue",
+    font=("Arial", 24),
+    fg="#BBBBBB",
+    bg="#1E1E2E",
 )
-sub_header.pack(pady=(0, 40))
+subtitle.pack(pady=20)
 
-# Button hover effects
-def on_enter(e): e.widget.config(bg=BTN_HOVER)
-def on_leave(e): e.widget.config(bg=BTN_COLOR)
+# ------------------------ PASSWORD ENTRY ------------------------
+password_var = tk.StringVar()
 
-# Buttons Frame
-btn_frame = tk.Frame(root, bg=BG_COLOR)
-btn_frame.pack(pady=20)
+password_entry = tk.Entry(root, textvariable=password_var, show="*", font=("Arial", 20))
+password_entry.pack(pady=20)
+password_entry.focus_set()
 
-btn_rfid = tk.Button(
-    btn_frame,
-    text="📡  RFID MODULE",
-    font=("Helvetica", 22, "bold"),
-    bg=BTN_COLOR,
-    fg="white",
-    width=22,
-    height=2,
-    command=run_rfid,
-    relief="flat",
-    bd=0,
-)
-btn_rfid.pack(pady=15)
-btn_rfid.bind("<Enter>", on_enter)
-btn_rfid.bind("<Leave>", on_leave)
+def authenticate():
+    if password_var.get() == "1234":
+        password_frame.pack_forget()
+        show_buttons()
+    else:
+        messagebox.showerror("Access Denied", "Incorrect Password!")
+        password_var.set("")
+        password_entry.focus_set()
 
-btn_face = tk.Button(
-    btn_frame,
-    text="🙂  FACE MODULE",
-    font=("Helvetica", 22, "bold"),
-    bg=BTN_COLOR,
-    fg="white",
-    width=22,
-    height=2,
-    command=run_face,
-    relief="flat",
-    bd=0,
-)
-btn_face.pack(pady=15)
-btn_face.bind("<Enter>", on_enter)
-btn_face.bind("<Leave>", on_leave)
+# ------------------------ AUTH FRAME ------------------------
+password_frame = tk.Frame(root, bg="#1E1E2E")
+password_frame.pack()
+password_frame.pack_propagate(False)
 
-btn_close = tk.Button(
-    root,
-    text="⬅️  RETURN TO MAIN",
-    font=("Helvetica", 20, "bold"),
-    bg="#244A57",
-    fg="white",
-    width=20,
-    height=1,
-    command=close_launcher,
-    relief="flat",
-    bd=0,
-)
-btn_close.pack(pady=(60, 10))
+password_button = tk.Button(password_frame, text="🔒 Unlock", command=authenticate, **button_style)
+password_button.pack(pady=10)
 
-# Footer
-footer = tk.Label(
-    root,
-    text="Developed by Vadeendra Karanam",
-    font=("Helvetica", 16),
-    bg=BG_COLOR,
-    fg=FOOTER_COLOR
-)
+# ------------------------ MODULE BUTTONS ------------------------
+buttons_frame = tk.Frame(root, bg="#1E1E2E")
+buttons_frame.pack(pady=50)
+
+def show_buttons():
+    # Clear password widgets
+    password_frame.pack_forget()
+    
+    # Buttons
+    rfid_btn = tk.Button(buttons_frame, text="🔑 RFID MODULE", command=run_rfid, **button_style)
+    rfid_btn.pack(pady=20)
+    
+    face_btn = tk.Button(buttons_frame, text="👁 FACE RECOGNITION", command=run_face, **button_style)
+    face_btn.pack(pady=20)
+    
+    close_btn = tk.Button(buttons_frame, text="⏹ CLOSE & RETURN", command=close_launcher, **button_style)
+    close_btn.config(bg="#FF5555", activebackground="#E04747")
+    close_btn.pack(pady=30)
+
+# ------------------------ FOOTER ------------------------
+footer = tk.Label(root, text="Developed by Vadeendra Karanam",
+                  font=("Helvetica", 16), bg="#1E1E2E", fg="#BBBBBB")
 footer.pack(side="bottom", pady=20)
 
-# Exit with Esc
-root.bind("<Escape>", lambda e: root.destroy())
-
+# ------------------------ RUN LOOP ------------------------
 root.mainloop()
