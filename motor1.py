@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# Fullscreen Smart Lock Launcher with Password + Auto Return
-
 import tkinter as tk
 from tkinter import messagebox
 import subprocess
@@ -13,12 +11,10 @@ FACE_PY_PATH = "/home/project/Desktop/Att/face.py"
 AUTO_RETURN_TIME = 120  # 2 minutes
 
 # ------------------------ MODULE LAUNCHERS ------------------------
-def run_module_and_return(path, name):
-    """Run a module and return to main system after it exits"""
+def run_module(path, name):
+    """Run a module without automatically returning to main system."""
     try:
-        proc = subprocess.Popen(["python3", path])
-        proc.wait()  # Wait until module exits
-        subprocess.Popen(["python3", MAIN_PY_PATH])  # Return to main system
+        subprocess.run(["python3", path])
     except Exception as e:
         messagebox.showerror("Error", f"Failed to launch {name}:\n{e}")
 
@@ -95,34 +91,35 @@ class LauncherApp:
             "cursor": "hand2",
         }
 
+        # ---------------- Submodule Buttons ----------------
         tk.Button(self.frame, text="🔑 RFID MODULE",
-                  command=lambda: run_module_and_return(RFID_PY_PATH, "RFID Module"),
+                  command=lambda: run_module(RFID_PY_PATH, "RFID Module"),
                   **button_style).pack(pady=15)
 
         tk.Button(self.frame, text="👁 FACE RECOGNITION",
-                  command=lambda: run_module_and_return(FACE_PY_PATH, "Face Recognition"),
+                  command=lambda: run_module(FACE_PY_PATH, "Face Recognition"),
                   **button_style).pack(pady=15)
 
+        # ---------------- Return / Main System Buttons ----------------
         tk.Button(self.frame, text="⏹ MAIN SYSTEM",
-                  command=lambda: run_module_and_return(MAIN_PY_PATH, "Main System"),
+                  command=self.return_home,
                   **button_style, bg="#FF5555", activebackground="#E04747").pack(pady=15)
 
-        # ---------------- Return to Home Button ----------------
         tk.Button(self.frame, text="🏠 RETURN TO HOME",
                   command=self.return_home,
                   **button_style, bg="#FFA500", activebackground="#E59400").pack(pady=20)
 
-        # Reset auto-return timer whenever user interacts
+        # Reset auto-return timer on any interaction
         self.frame.bind_all("<Button-1>", self.reset_timer)
         self.frame.bind_all("<Key>", self.reset_timer)
 
     def return_home(self, event=None):
-        """Return to main smart lock GUI"""
+        """Return to main smart lock GUI (1.py) and terminate launcher."""
         self.root.destroy()
         subprocess.Popen(["python3", MAIN_PY_PATH])
 
     def reset_timer(self, event=None):
-        """Reset auto-return timer on user interaction"""
+        """Reset auto-return timer on user interaction."""
         if self.auto_return_id:
             self.root.after_cancel(self.auto_return_id)
         self.auto_return_id = self.root.after(AUTO_RETURN_TIME * 1000, self.return_home)
