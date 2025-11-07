@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Fullscreen Smart Lock Launcher with Password + Auto Return + Terminate Button
+
 import tkinter as tk
 from tkinter import messagebox
 import subprocess
@@ -12,9 +14,10 @@ AUTO_RETURN_TIME = 120  # 2 minutes
 
 # ------------------------ MODULE LAUNCHERS ------------------------
 def run_module(path, name):
-    """Run a module without automatically returning to main system."""
+    """Run a module but do NOT auto-run 1.py after it closes"""
     try:
-        subprocess.run(["python3", path])
+        proc = subprocess.Popen(["python3", path])
+        proc.wait()  # Wait until module exits
     except Exception as e:
         messagebox.showerror("Error", f"Failed to launch {name}:\n{e}")
 
@@ -43,6 +46,7 @@ class LauncherApp:
         self.fullscreen = not self.fullscreen
         self.root.attributes("-fullscreen", self.fullscreen)
 
+    # ---------------- Password Screen ----------------
     def password_screen(self):
         for widget in self.frame.winfo_children():
             widget.destroy()
@@ -71,6 +75,7 @@ class LauncherApp:
         else:
             messagebox.showerror("Access Denied", "Incorrect Password!")
 
+    # ---------------- Main Buttons ----------------
     def show_main_buttons(self):
         for widget in self.frame.winfo_children():
             widget.destroy()
@@ -107,19 +112,31 @@ class LauncherApp:
 
         tk.Button(self.frame, text="🏠 RETURN TO HOME",
                   command=self.return_home,
-                  **button_style, bg="#FFA500", activebackground="#E59400").pack(pady=20)
+                  **button_style, bg="#FFA500", activebackground="#E59400").pack(pady=15)
+
+        # ---------------- TERMINATE & GO TO MAIN ----------------
+        tk.Button(self.frame, text="❌ TERMINATE & GO TO MAIN",
+                  command=self.terminate_and_go_main,
+                  **button_style, bg="#FF0000", activebackground="#CC0000").pack(pady=20)
 
         # Reset auto-return timer on any interaction
         self.frame.bind_all("<Button-1>", self.reset_timer)
         self.frame.bind_all("<Key>", self.reset_timer)
 
+    # ---------------- Return to Main System ----------------
     def return_home(self, event=None):
-        """Return to main smart lock GUI (1.py) and terminate launcher."""
+        """Return to main smart lock GUI after timer or button"""
         self.root.destroy()
         subprocess.Popen(["python3", MAIN_PY_PATH])
 
+    # ---------------- Terminate Button ----------------
+    def terminate_and_go_main(self):
+        """Immediately terminate launcher and start main system"""
+        self.root.destroy()
+        subprocess.Popen(["python3", MAIN_PY_PATH])
+
+    # ---------------- Auto Return Timer ----------------
     def reset_timer(self, event=None):
-        """Reset auto-return timer on user interaction."""
         if self.auto_return_id:
             self.root.after_cancel(self.auto_return_id)
         self.auto_return_id = self.root.after(AUTO_RETURN_TIME * 1000, self.return_home)
