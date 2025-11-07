@@ -1,19 +1,10 @@
+#!/usr/bin/env python3
+# sentinel_smart_lock.py — Full integrated GUI + RFID + Face + Lock
+
 import sys
 import os
 sys.path.insert(0, os.path.abspath("/home/project/Desktop/Att/lib"))
 
-#!/usr/bin/env python3
-"""
-sentinel_smart_lock.py
-Full integrated Sentinel Smart Lock:
-- Fullscreen Tkinter GUI with camera preview (auto-detect)
-- RFID (optional), Face recognition (optional)
-- CSV logging, cooldown persistence, startup state recovery
-- Add User button -> launches /home/project/Desktop/Att/add.py (auto-return after 2 minutes)
-"""
-
-import os
-import sys
 import time
 import datetime
 import json
@@ -32,14 +23,14 @@ import tkinter as tk
 from tkinter import ttk
 from PIL import Image, ImageTk
 
-# Try RPi GPIO + RFID; if not available, we'll keep running without hardware
+# Try to import RPi.GPIO and mfrc522. If unavailable, script still runs (GPIO/RFID disabled).
 try:
     import RPi.GPIO as GPIO
     from mfrc522 import SimpleMFRC522
 except Exception:
     GPIO = None
     SimpleMFRC522 = None
-    print("Warning: RPi.GPIO or mfrc522 not available (running off-Pi?)")
+    print("Warning: RPi.GPIO or mfrc522 not available — running without GPIO/RFID hardware support.")
 
 # ---------------- CONFIG ----------------
 LOG_FILE = "access_log.csv"
@@ -48,25 +39,23 @@ MASTER_TAG = "769839607204"
 MASTER_NAME = "Universal"
 
 RELAY_GPIO = 11
-COOLDOWN_TIME = 10          # seconds per user
-ADD_USER_TIMEOUT = 120      # seconds (2 minutes)
-COOLDOWN_SAVE_INTERVAL = 5  # seconds
-
-CAM_TRY_INDICES = list(range(0, 5))  # try these indices for camera
+COOLDOWN_TIME = 10         # seconds per user
+ADD_USER_TIMEOUT = 120     # seconds to auto-return
+COOLDOWN_SAVE_INTERVAL = 5 # seconds
+CAM_TRY_INDICES = list(range(0, 5))
 CAM_WIDTH = 640
 CAM_HEIGHT = 480
 
-# ---------------- STATE + LOCKS ----------------
+# ---------------- STATE & LOCKS ----------------
 csv_mutex = Lock()
 cooldown_mutex = Lock()
 lock_mutex = Lock()
 frame_mutex = Lock()
 
-user_last_action = {}       # identifier -> last action timestamp
+user_last_action = {}   # identifier -> last action epoch
 lock_open = False
 current_user = None
 
-# GUI-shared state dict
 gui_state = {
     "rfid_text": "None",
     "face_text": "None",
@@ -75,12 +64,11 @@ gui_state = {
     "last_user_activity": time.time(),
 }
 
-# Ensure CSV exists
 columns = ["Method", "Identifier", "Open Timestamp", "Close Timestamp", "Detected Timestamp"]
 if not os.path.exists(LOG_FILE):
     pd.DataFrame(columns=columns).to_csv(LOG_FILE, index=False)
 
-# ---------------- GPIO SETUP ----------------
+# ---------------- GPIO Setup ----------------
 def gpio_setup():
     if GPIO is None:
         return
@@ -91,7 +79,7 @@ def gpio_setup():
 
 gpio_setup()
 
-# ---------------- LOGGING ----------------
+# ---------------- CSV Logging ----------------
 def log_entry(method, identifier, open_time="", close_time="", detected_time=""):
     with csv_mutex:
         try:
@@ -111,7 +99,7 @@ def log_entry(method, identifier, open_time="", close_time="", detected_time="")
             df.loc[len(df)] = [method, identifier, "", "", detected_time]
         df.to_csv(LOG_FILE, index=False)
 
-# ---------------- COOLDOWN SAVE/LOAD ----------------
+# ---------------- Cooldown persistence ----------------
 def save_cooldown():
     with cooldown_mutex:
         try:
@@ -131,7 +119,7 @@ def load_cooldown():
 
 load_cooldown()
 
-# ---------------- STARTUP RECOVERY ----------------
+# ---------------- Startup lock recovery ----------------
 def check_last_lock_state():
     global lock_open, current_user
     try:
@@ -164,13 +152,12 @@ def check_last_lock_state():
 
 check_last_lock_state()
 
-# ---------------- LOCK CONTROL ----------------
+# ---------------- Lock control helpers ----------------
 def open_lock(method, identifier):
     global lock_open, current_user
     with lock_mutex:
-        last_time = user_last_action.get(identifier, 0)
-        if time.time() - float(last_time) < COOLDOWN_TIME:
-            # cooldown active
+        last = user_last_action.get(identifier, 0)
+        if time.time() - float(last) < COOLDOWN_TIME:
             return False
         if not lock_open:
             if GPIO is not None:
@@ -195,8 +182,8 @@ def close_lock():
     with lock_mutex:
         if current_user is None:
             return False
-        last_time = user_last_action.get(current_user, 0)
-        if time.time() - float(last_time) < COOLDOWN_TIME:
+        last = user_last_action.get(current_user, 0)
+        if time.time() - float(last) < COOLDOWN_TIME:
             return False
         if lock_open:
             if GPIO is not None:
@@ -216,28 +203,26 @@ def close_lock():
             return True
         return False
 
-# ---------------- RFID THREAD ----------------
+# ---------------- RFID Thread ----------------
 reader = None
 if SimpleMFRC522 is not None:
     try:
         reader = SimpleMFRC522()
     except Exception:
         reader = None
-        print("RFID reader init failed")
+        print("RFID init failed")
 
 def handle_rfid_detection(tag_id):
     tag_str = str(tag_id)
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    # MASTER tag behavior
+    # master tag behavior
     if tag_str == MASTER_TAG:
-        last_time = user_last_action.get(MASTER_NAME, 0)
-        if time.time() - float(last_time) < COOLDOWN_TIME:
+        last = user_last_action.get(MASTER_NAME, 0)
+        if time.time() - float(last) < COOLDOWN_TIME:
             return
         if lock_open:
             # close
             close_lock()
-            # log close with master
             try:
                 df = pd.read_csv(LOG_FILE)
                 mask = (df["Open Timestamp"] != "") & (df["Close Timestamp"] == "")
@@ -262,7 +247,7 @@ def handle_rfid_detection(tag_id):
         gui_state["last_user_activity"] = time.time()
         return
 
-    # Normal RFID lookup
+    # lookup normal users
     try:
         conn = sqlite3.connect("rfid_data.db")
         cursor = conn.cursor()
@@ -274,7 +259,6 @@ def handle_rfid_detection(tag_id):
 
     if not res:
         log_entry("RFID", f"Unknown({tag_str})", detected_time=now)
-        print(f"⚠️ Unknown RFID {tag_str} detected — logged only")
         gui_state["rfid_text"] = f"Unknown({tag_str})"
         gui_state["last_user_activity"] = time.time()
         return
@@ -283,19 +267,17 @@ def handle_rfid_detection(tag_id):
     identifier = f"{name}({tag_str})"
     gui_state["rfid_text"] = f"{tag_str} - {name}"
     gui_state["last_user_activity"] = time.time()
-
     if lock_open:
         if current_user == identifier:
             close_lock()
         else:
-            print(f"📟 Detected {identifier} (lock already opened)")
             log_entry("RFID", identifier, detected_time=now)
     else:
         open_lock("RFID", identifier)
 
 def rfid_thread_loop(stop_event: Event):
     if reader is None:
-        print("RFID thread: reader not available, skipping.")
+        print("RFID reader not present; skipping RFID thread.")
         return
     while not stop_event.is_set():
         try:
@@ -306,7 +288,7 @@ def rfid_thread_loop(stop_event: Event):
             traceback.print_exc()
         time.sleep(0.2)
 
-# ---------------- FACE RECOGNITION (uses shared frame) ----------------
+# ---------------- Face recognition setup ----------------
 detector = dlib.get_frontal_face_detector()
 predictor = None
 face_model = None
@@ -316,7 +298,7 @@ try:
 except Exception as e:
     predictor = None
     face_model = None
-    print("Face model files missing or dlib init error:", e)
+    print("Face model error:", e)
 
 known_features = []
 known_names = []
@@ -325,39 +307,36 @@ def load_face_db():
         df = pd.read_csv("data/features_all.csv", header=None)
         for i in range(df.shape[0]):
             known_names.append(df.iloc[i, 0])
-            feat = [float(df.iloc[i, j]) for j in range(1, 129)]
-            known_features.append(feat)
+            known_features.append([float(df.iloc[i, j]) for j in range(1, 129)])
 load_face_db()
 
 def face_thread_loop(stop_event: Event):
     global frame
-    # We'll read frames from the shared `frame` produced by camera thread
     while not stop_event.is_set():
         if predictor is None or face_model is None or not known_features:
             time.sleep(0.5)
             continue
         with frame_mutex:
-            local_frame = None if frame is None else frame.copy()
-        if local_frame is None:
+            local = None if 'frame' not in globals() else (None if frame is None else frame.copy())
+        if local is None:
             time.sleep(0.05)
             continue
         try:
-            # convert to BGR for dlib if necessary (our frame is RGB)
-            bgr = cv2.cvtColor(local_frame, cv2.COLOR_RGB2BGR)
+            # local is RGB - convert to BGR for dlib
+            bgr = cv2.cvtColor(local, cv2.COLOR_RGB2BGR)
             faces = detector(bgr, 0)
             recognized = False
-            for face in faces:
-                shape = predictor(bgr, face)
-                feature = np.array(face_model.compute_face_descriptor(bgr, shape))
-                distances = [np.linalg.norm(feature - np.array(f)) for f in known_features]
+            for f in faces:
+                shape = predictor(bgr, f)
+                feat = np.array(face_model.compute_face_descriptor(bgr, shape))
+                distances = [np.linalg.norm(feat - np.array(x)) for x in known_features]
                 if distances and min(distances) < 0.6:
                     name = known_names[int(np.argmin(distances))]
                     gui_state["face_text"] = name
                     gui_state["last_user_activity"] = time.time()
-                    # open/close logic
                     if lock_open and current_user == name:
-                        last_time = user_last_action.get(name, 0)
-                        if time.time() - float(last_time) >= COOLDOWN_TIME:
+                        last = user_last_action.get(name, 0)
+                        if time.time() - float(last) >= COOLDOWN_TIME:
                             close_lock()
                     elif not lock_open:
                         open_lock("FACE", name)
@@ -371,26 +350,29 @@ def face_thread_loop(stop_event: Event):
             traceback.print_exc()
         time.sleep(0.12)
 
-# ---------------- PERIODIC COOLDOWN SAVE ----------------
+# ---------------- cooldown saver ----------------
 def cooldown_saver_loop(stop_event: Event):
     while not stop_event.is_set():
         save_cooldown()
         time.sleep(COOLDOWN_SAVE_INTERVAL)
 
-# ---------------- CAMERA THREAD (single capture) ----------------
+# ---------------- Camera capture (single) ----------------
 camera_cap = None
+frame = None
 def camera_init_and_stream(stop_event: Event):
     global camera_cap, frame
     # small warmup
-    time.sleep(1.0)
+    time.sleep(0.5)
     camera_cap = None
     for idx in CAM_TRY_INDICES:
         try:
             cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
             if not cap.isOpened():
-                cap.release()
+                try:
+                    cap.release()
+                except:
+                    pass
                 continue
-            # set resolution
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
             camera_cap = cap
@@ -405,19 +387,18 @@ def camera_init_and_stream(stop_event: Event):
     while not stop_event.is_set():
         ret, img = camera_cap.read()
         if ret:
-            # convert to RGB for PIL
             rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             with frame_mutex:
                 frame = rgb
         else:
-            time.sleep(0.05)
+            time.sleep(0.03)
 
     try:
         camera_cap.release()
     except Exception:
         pass
 
-# ---------------- GUI ----------------
+# ---------------- GUI Class ----------------
 class SentinelGUI:
     def __init__(self, root, stop_event: Event):
         self.root = root
@@ -427,21 +408,16 @@ class SentinelGUI:
         self.bg = "#071428"
         root.configure(bg=self.bg)
 
-        # header
         self.header = tk.Label(root, text="🛡️ Sentinel Smart Lock", font=("Helvetica", 34, "bold"), bg=self.bg, fg="#7BE0E0")
         self.header.pack(pady=(12, 6))
-
-        # datetime
         self.time_label = tk.Label(root, text="", font=("Helvetica", 16), bg=self.bg, fg="#CFEFF0")
         self.time_label.pack()
 
-        # camera frame
         self.cam_frame = tk.Frame(root, bg="#07202A", bd=6, relief="ridge")
         self.cam_frame.pack(pady=16)
         self.camera_label = tk.Label(self.cam_frame)
         self.camera_label.pack()
 
-        # status
         self.status_frame = tk.Frame(root, bg=self.bg)
         self.status_frame.pack(pady=(10, 10))
         self.rfid_label = tk.Label(self.status_frame, text="RFID Detected : None", font=("Helvetica", 18), bg=self.bg, fg="#A3FFD9")
@@ -451,11 +427,9 @@ class SentinelGUI:
         self.lock_label = tk.Label(self.status_frame, text="Lock Status   : Closed", font=("Helvetica", 18), bg=self.bg, fg="#FFD27A")
         self.lock_label.pack(pady=4)
 
-        # add user button
         self.add_btn = tk.Button(root, text="➕ ADD USER", font=("Helvetica", 20, "bold"), bg="#1E7A6F", fg="white", padx=30, pady=10, command=self.on_add_user)
         self.add_btn.pack(pady=(14, 30))
 
-        # footer
         self.footer = tk.Label(root, text="Developed by Vadeendra Karanam", font=("Helvetica", 14), bg=self.bg, fg="#9FB9BE")
         self.footer.pack(side="bottom", pady=8)
 
@@ -465,11 +439,10 @@ class SentinelGUI:
         self.update_status()
         self.check_add_user_timeout()
 
-        # close binds
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.bind("<Escape>", lambda e: self.on_close())
 
-        self.add_proc = None  # subprocess Popen for add.py
+        self.add_proc = None
 
     def update_clock(self):
         self.time_label.config(text=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -477,11 +450,10 @@ class SentinelGUI:
             self.root.after(1000, self.update_clock)
 
     def update_frame(self):
-        # read global frame and display resized appropriately
         with frame_mutex:
             local = None if frame is None else frame.copy()
         if local is not None:
-            # compute desired size - take 55% width and 50% height of screen
+            # compute size relative to screen
             sw = self.root.winfo_screenwidth()
             sh = self.root.winfo_screenheight()
             w = int(sw * 0.55)
@@ -505,60 +477,42 @@ class SentinelGUI:
             self.root.after(500, self.update_status)
 
     def on_add_user(self):
-        # hide main widgets and show a placeholder while launching add.py externally
         gui_state["add_user_active"] = True
         gui_state["last_user_activity"] = time.time()
-
-        # hide everything
+        # hide widgets
         for w in self.root.winfo_children():
             w.pack_forget()
-
-        # show temporary message
-        self.temp_label = tk.Label(self.root, text="🧍‍♂️ Add User Mode Active...\nClose the window or wait 2 minutes to return.",
+        # show temp message
+        self.temp_label = tk.Label(self.root, text="🧍‍♂️ Add User Mode Active...\nClose add.py or wait 2 minutes to return.",
                                    font=("Helvetica", 22, "bold"), bg=self.bg, fg="#66FFAA", justify="center")
         self.temp_label.pack(expand=True)
-
         # launch add.py non-blocking
         try:
             add_path = "/home/project/Desktop/Att/add.py"
             if os.path.exists(add_path):
-                # Use Popen so we can launch without blocking
                 self.add_proc = subprocess.Popen([sys.executable, add_path])
             else:
                 print("add.py not found at", add_path)
         except Exception as e:
             print("Error launching add.py:", e)
-
-        # start checking for return
         self.root.after(1000, self.check_add_user_close)
 
     def check_add_user_close(self):
-        # if process ended -> return; or timeout -> return
-        # Update last activity timestamp if add.py still running — we cannot know, so rely on timeout
         if self.add_proc is not None:
             ret = self.add_proc.poll()
             if ret is not None:
-                # process finished
                 gui_state["add_user_active"] = False
-
-        # timeout check based on last_user_activity
         if time.time() - float(gui_state.get("last_user_activity", 0)) > ADD_USER_TIMEOUT:
             gui_state["add_user_active"] = False
-
         if not gui_state.get("add_user_active", False):
-            # clear temp
             try:
                 self.temp_label.pack_forget()
             except Exception:
                 pass
-            # rebuild full GUI by re-packing widgets (simplest approach: restart app window)
-            # simpler: destroy and re-create root UI by exiting and re-running; here we'll restart python process
-            print("Returning to main GUI (restarting UI)...")
+            print("Returning to main UI (restarting process to rebuild GUI)...")
             save_cooldown()
             os.execv(sys.executable, [sys.executable] + sys.argv)
             return
-
-        # else check again
         if not self.stop_event.is_set():
             self.root.after(2000, self.check_add_user_close)
 
@@ -570,8 +524,7 @@ class SentinelGUI:
             self.root.after(5000, self.check_add_user_timeout)
 
     def on_close(self):
-        # cleanup and exit
-        print("Exiting GUI...")
+        print("Exiting...")
         gui_state["add_user_active"] = False
         save_cooldown()
         self.stop_event.set()
@@ -591,45 +544,37 @@ class SentinelGUI:
             pass
         os._exit(0)
 
-# ---------------- MAIN START ----------------
+# ---------------- Main startup ----------------
 def start_all():
-    # event to signal threads to stop
     stop_event = Event()
 
-    # Start camera thread (single capture used by GUI and face)
     cam_thread = Thread(target=camera_init_and_stream, args=(stop_event,), daemon=True)
     cam_thread.start()
 
-    # Start face thread (reads shared frame)
     face_thread = Thread(target=face_thread_loop, args=(stop_event,), daemon=True)
     face_thread.start()
 
-    # Start cooldown saver
     saver_thread = Thread(target=cooldown_saver_loop, args=(stop_event,), daemon=True)
     saver_thread.start()
 
-    # Start RFID thread if reader present
     if reader is not None:
         r_thread = Thread(target=rfid_thread_loop, args=(stop_event,), daemon=True)
         r_thread.start()
     else:
-        print("RFID reader not present - RFID thread skipped")
+        print("RFID hardware not present — RFID disabled.")
 
-    # start GUI (blocking)
     root = tk.Tk()
     gui = SentinelGUI(root, stop_event)
-    # attach stop_event to gui so on_close can set it
     gui.stop_event = stop_event
     root.mainloop()
 
-    # on exit set stop_event and join threads
     stop_event.set()
 
 if __name__ == "__main__":
     try:
         start_all()
     except KeyboardInterrupt:
-        print("KeyboardInterrupt - exiting")
+        print("Keyboard interrupt — exiting")
     except Exception:
         traceback.print_exc()
     finally:
