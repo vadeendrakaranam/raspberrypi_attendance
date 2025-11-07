@@ -1,15 +1,14 @@
-# rpi_lock_thingspeak.py
-import RPi.GPIO as GPIO
-import time, datetime, requests, pandas as pd, os, json
+import sys, os, time, datetime, requests, pandas as pd
 from threading import Thread, Lock
+import RPi.GPIO as GPIO
 
 # ---------------- CONFIG ----------------
 CHANNEL_ID = "3132182"
 READ_KEY = "3YJIO2DTT8M2HWJX"
 WRITE_KEY = "FTEDV3SYUMLHEUKP"
 
-FIELD_STATUS = 3    # lock status field
-FIELD_CMD = 4       # command field
+FIELD_STATUS = 3    # Lock status field
+FIELD_CMD = 4       # Command field
 UPLOAD_INTERVAL = 10  # seconds
 CMD_POLL_INTERVAL = 5
 
@@ -25,6 +24,7 @@ GPIO.output(RELAY_GPIO, GPIO.LOW)   # initially locked
 
 csv_mutex = Lock()
 lock_open = False
+last_status = None
 
 # ---------------- CSV INIT ----------------
 if not os.path.exists(LOG_FILE):
@@ -68,6 +68,9 @@ def close_lock(method="WEB", identifier="Admin"):
 # ---------------- THINGSPEAK SYNC ----------------
 def update_status_to_thingspeak(status):
     """Push current lock status to Field 3."""
+    global last_status
+    if status == last_status:
+        return  # skip redundant updates
     try:
         r = requests.post("https://api.thingspeak.com/update.json", data={
             "api_key": WRITE_KEY,
@@ -75,6 +78,7 @@ def update_status_to_thingspeak(status):
         }, timeout=10)
         if r.status_code == 200:
             print(f"📡 Status uploaded: {status}")
+            last_status = status
     except Exception as e:
         print("⚠️ ThingSpeak update error:", e)
 
@@ -86,8 +90,13 @@ def fetch_command_from_thingspeak():
         r = requests.get(url, params=params, timeout=10)
         if r.status_code == 200:
             data = r.json()
-            cmd = str(data.get(f"field{FIELD_CMD}", "")).strip().upper()
-            return cmd
+            if isinstance(data, dict):
+                cmd = str(data.get(f"field{FIELD_CMD}", "")).strip().upper()
+                return cmd
+            elif isinstance(data, (int, float)):
+                return str(data).strip().upper()
+            else:
+                print("⚠️ Unexpected ThingSpeak data:", data)
     except Exception as e:
         print("⚠️ Command fetch error:", e)
     return ""
@@ -103,7 +112,8 @@ def thingspeak_thread():
                 open_lock("WEB", "Admin")
             elif cmd == "CLOSE_ADMIN":
                 close_lock("WEB", "Admin")
-        # update current GPIO status periodically
+
+        # periodically update GPIO status
         status = "OPEN" if GPIO.input(RELAY_GPIO) == GPIO.HIGH else "CLOSED"
         update_status_to_thingspeak(status)
         time.sleep(UPLOAD_INTERVAL)
@@ -123,4 +133,3 @@ if __name__ == "__main__":
         GPIO.output(RELAY_GPIO, GPIO.LOW)
         update_status_to_thingspeak("CLOSED")
         GPIO.cleanup()
-
