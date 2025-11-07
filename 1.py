@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-# Fullscreen Sentinel Smart Lock Launcher with Animated Authentication
+# Sentinel Smart Lock Launcher GUI — Fullscreen, Button-based
 
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import simpledialog, messagebox
 import subprocess
 import os
-import signal
 
-# ------------------------ PATHS ------------------------
+# ---------------- PATHS ----------------
 MAIN_PY_PATH = "/home/project/Desktop/Att/1.py"
 RFID_PY_PATH = "/home/project/Desktop/Att/rfid.py"
 FACE_PY_PATH = "/home/project/Desktop/Att/face.py"
 
-# ------------------------ UTILITIES ------------------------
+# ---------------- FUNCTIONS ----------------
 def kill_script(script_path):
     """Kill all running instances of a given script"""
     try:
@@ -20,10 +19,9 @@ def kill_script(script_path):
         pids = result.stdout.strip().split("\n")
         for pid in pids:
             if pid:
-                os.kill(int(pid), signal.SIGKILL)
-                print(f"✅ Killed {script_path} PID: {pid}")
+                os.kill(int(pid), 9)
     except Exception as e:
-        print(f"❌ Error killing {script_path}: {e}")
+        print(f"Error killing {script_path}: {e}")
 
 def run_rfid():
     kill_script(MAIN_PY_PATH)
@@ -39,21 +37,30 @@ def close_launcher():
     root.destroy()
     subprocess.Popen(["python3", MAIN_PY_PATH])
 
-# ------------------------ GUI SETUP ------------------------
+# ---------------- GUI ----------------
 root = tk.Tk()
 root.title("🔒 Sentinel Smart Lock Launcher")
 root.attributes("-fullscreen", True)
-root.configure(bg="#1E1E2E")  # dark background
+root.configure(bg="#1E1E2E")  # Dark background
 
-# Fullscreen toggle with ESC
-fullscreen = True
-def toggle_fullscreen(event=None):
-    global fullscreen
-    fullscreen = not fullscreen
-    root.attributes("-fullscreen", fullscreen)
-root.bind("<Escape>", toggle_fullscreen)
+# ---------------- AUTHENTICATION ----------------
+def authenticate():
+    password = simpledialog.askstring("Authentication", "Enter Password:", show="*")
+    if password == "1234":
+        show_buttons()
+    else:
+        messagebox.showerror("Access Denied", "Incorrect Password!")
+        root.destroy()
 
-# ------------------------ STYLES ------------------------
+# ---------------- BUTTONS ----------------
+def show_buttons():
+    label.pack(pady=20)
+    subtitle.pack(pady=10)
+    rfid_btn.pack(pady=15)
+    face_btn.pack(pady=15)
+    close_btn.pack(pady=20)
+
+# Styles
 button_style = {
     "font": ("Arial", 16, "bold"),
     "bg": "#4ECCA3",
@@ -63,96 +70,23 @@ button_style = {
     "relief": "flat",
     "width": 20,
     "height": 2,
-    "bd": 0,
     "cursor": "hand2",
 }
 
-# ------------------------ LABELS ------------------------
-label = tk.Label(
-    root,
-    text="Sentinel Smart Lock",
-    font=("Helvetica", 40, "bold"),
-    fg="#FFD369",
-    bg="#1E1E2E",
-)
-label.pack(pady=50)
+# Labels
+label = tk.Label(root, text="Sentinel Smart Lock", font=("Helvetica", 28, "bold"), fg="#FFD369", bg="#1E1E2E")
+subtitle = tk.Label(root, text="Choose Module to Launch", font=("Arial", 14), fg="#BBBBBB", bg="#1E1E2E")
 
-subtitle = tk.Label(
-    root,
-    text="Enter Password to Continue",
-    font=("Arial", 24),
-    fg="#BBBBBB",
-    bg="#1E1E2E",
-)
-subtitle.pack(pady=20)
+# Buttons
+rfid_btn = tk.Button(root, text="🔑 RFID MODULE", command=run_rfid, **button_style)
+face_btn = tk.Button(root, text="👁 FACE RECOGNITION", command=run_face, **button_style)
+close_btn = tk.Button(root, text="⏹ CLOSE & RETURN", command=close_launcher, **button_style, bg="#FF5555", activebackground="#E04747")
 
-# ------------------------ PASSWORD ENTRY ------------------------
-password_var = tk.StringVar()
-password_entry = tk.Entry(root, textvariable=password_var, show="*", font=("Arial", 20))
-password_entry.pack(pady=20)
-password_entry.focus_set()
+# ---------------- EXIT FULLSCREEN ON ESC ----------------
+def exit_fullscreen(event=None):
+    root.attributes("-fullscreen", False)
+root.bind("<Escape>", exit_fullscreen)
 
-password_button = tk.Button(root, text="🔒 Unlock", command=lambda: authenticate(animated=True), **button_style)
-password_button.pack(pady=10)
-
-# ------------------------ MODULE BUTTONS (HIDDEN INITIALLY) ------------------------
-buttons_frame = tk.Frame(root, bg="#1E1E2E")
-buttons = []
-
-def show_buttons():
-    rfid_btn = tk.Button(buttons_frame, text="🔑 RFID MODULE", command=run_rfid, **button_style)
-    rfid_btn.pack(pady=20)
-    face_btn = tk.Button(buttons_frame, text="👁 FACE RECOGNITION", command=run_face, **button_style)
-    face_btn.pack(pady=20)
-    close_btn = tk.Button(buttons_frame, text="⏹ CLOSE & RETURN", command=close_launcher, **button_style)
-    close_btn.config(bg="#FF5555", activebackground="#E04747")
-    close_btn.pack(pady=30)
-    buttons_frame.pack(pady=50)
-
-# ------------------------ AUTHENTICATION & ANIMATION ------------------------
-def authenticate(animated=False):
-    if password_var.get() == "1234":
-        if animated:
-            slide_up_password()
-        else:
-            password_entry.pack_forget()
-            password_button.pack_forget()
-            show_buttons()
-    else:
-        messagebox.showerror("Access Denied", "Incorrect Password!")
-        password_var.set("")
-        password_entry.focus_set()
-
-def slide_up_password():
-    """Slide password entry and button up, then reveal buttons"""
-    # Get initial positions
-    entry_y = password_entry.winfo_y()
-    button_y = password_button.winfo_y()
-    step = 10  # pixels per frame
-
-    def animate():
-        nonlocal entry_y, button_y
-        entry_y -= step
-        button_y -= step
-        password_entry.place(y=entry_y)
-        password_button.place(y=button_y)
-        if button_y > -50:
-            root.after(15, animate)
-        else:
-            password_entry.destroy()
-            password_button.destroy()
-            show_buttons()
-
-    # Convert pack to place for animation
-    password_entry.pack_forget()
-    password_button.pack_forget()
-    password_entry.place(x=root.winfo_width()//2 - 150, y=password_entry.winfo_y())
-    password_button.place(x=root.winfo_width()//2 - 100, y=password_button.winfo_y())
-    animate()
-
-# ------------------------ FOOTER ------------------------
-footer = tk.Label(root, text="Developed by Vadeendra Karanam",
-                  font=("Helvetica", 16), bg="#1E1E2E", fg="#BBBBBB")
-footer.pack(side="bottom", pady=20)
-
+# ---------------- START ----------------
+authenticate()  # prompt for password on launch
 root.mainloop()
