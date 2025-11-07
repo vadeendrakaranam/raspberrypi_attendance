@@ -1,200 +1,126 @@
-import sys, os
-sys.path.insert(0, os.path.abspath("/home/project/Desktop/Att/lib"))
-
-import tkinter as tk
-from PIL import Image, ImageTk
-import threading
-import time
-import datetime
-import csv
-import os
-import cv2
+# rpi_lock_thingspeak.py
 import RPi.GPIO as GPIO
-import dlib
-import pandas as pd
-from mfrc522 import SimpleMFRC522
+import time, datetime, requests, pandas as pd, os, json
+from threading import Thread, Lock
 
-# ---------------- GPIO SETUP ----------------
-RELAY_GPIO = 11
+# ---------------- CONFIG ----------------
+CHANNEL_ID = "3132182"
+READ_KEY = "3YJIO2DTT8M2HWJX"
+WRITE_KEY = "FTEDV3SYUMLHEUKP"
+
+FIELD_STATUS = 3    # lock status field
+FIELD_CMD = 4       # command field
+UPLOAD_INTERVAL = 10  # seconds
+CMD_POLL_INTERVAL = 5
+
+LOG_FILE = "access_log.csv"
+columns = ["Method", "Identifier", "Open Timestamp", "Close Timestamp"]
+
+# ---------------- GPIO ----------------
+GPIO.setwarnings(False)
 GPIO.setmode(GPIO.BOARD)
+RELAY_GPIO = 11
 GPIO.setup(RELAY_GPIO, GPIO.OUT)
-GPIO.output(RELAY_GPIO, GPIO.LOW)
+GPIO.output(RELAY_GPIO, GPIO.LOW)   # initially locked
 
-# ---------------- GLOBAL STATE ----------------
-auth_state = {"face_verified": False, "rfid_verified": False, "name": None}
+csv_mutex = Lock()
+lock_open = False
 
-FACE_CSV = "face_access_log.csv"
-RFID_CSV = "rfid_access_log.csv"
+# ---------------- CSV INIT ----------------
+if not os.path.exists(LOG_FILE):
+    pd.DataFrame(columns=columns).to_csv(LOG_FILE, index=False)
 
-# ---------------- LOGGING ----------------
-def log_event(csv_file, name, event):
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    exists = os.path.exists(csv_file)
-    with open(csv_file, "a", newline="") as f:
-        writer = csv.writer(f)
-        if not exists:
-            writer.writerow(["Name","Event","Timestamp"])
-        writer.writerow([name,event,now])
-
-# ---------------- LOAD FACE DATABASE ----------------
-face_detector = dlib.get_frontal_face_detector()
-predictor = dlib.shape_predictor("data/data_dlib/shape_predictor_68_face_landmarks.dat")
-face_rec_model = dlib.face_recognition_model_v1("data/data_dlib/dlib_face_recognition_resnet_model_v1.dat")
-
-face_names = []
-face_features = []
-
-if os.path.exists("data/features_all.csv"):
-    df = pd.read_csv("data/features_all.csv", header=None)
-    for i in range(df.shape[0]):
-        face_names.append(df.iloc[i, 0])
-        face_features.append(list(df.iloc[i, 1:129]))
-else:
-    print("❌ Face database not found.")
-    exit()
-
-# ---------------- FACE DETECTION ----------------
-def detect_face(face_label, status_label, tick_label):
-    cap = cv2.VideoCapture(0)
-    detected = False
-
-    while not detected:
-        ret, frame = cap.read()
-        if not ret:
-            continue
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_detector(gray)
-
-        for face in faces:
-            shape = predictor(frame, face)
-            feature = face_rec_model.compute_face_descriptor(frame, shape)
-            distances = [np.linalg.norm(np.array(feature)-np.array(f)) for f in face_features]
-
-            if distances and min(distances) < 0.6:
-                name = face_names[distances.index(min(distances))]
-                detected = True
-                auth_state["face_verified"] = True
-                auth_state["name"] = name
-                status_label.config(text=f"✅ Face Verified: {name}")
-                tick_label.config(text="✅")
-                log_event(FACE_CSV, name, "Face Detected")
+def log_entry(method, identifier, open_time="", close_time=""):
+    with csv_mutex:
+        df = pd.read_csv(LOG_FILE)
+        if open_time:
+            df.loc[len(df)] = [method, identifier, open_time, ""]
+        elif close_time:
+            mask = (df["Close Timestamp"] == "") & (df["Open Timestamp"] != "")
+            if mask.any():
+                idx = df[mask].index[-1]
+                df.loc[idx, "Close Timestamp"] = close_time
             else:
-                status_label.config(text="❌ Unknown Face")
+                df.loc[len(df)] = [method, identifier, "", close_time]
+        df.to_csv(LOG_FILE, index=False)
 
-            # Draw rectangle
-            x, y, w, h = face.left(), face.top(), face.width(), face.height()
-            cv2.rectangle(frame, (x,y), (x+w, y+h), (0,255,0), 2)
-        
-        # Convert for Tkinter
-        label_width = face_label.winfo_width() or 400
-        label_height = face_label.winfo_height() or 300
-        frame_resized = cv2.resize(frame, (label_width, label_height))
-        img = Image.fromarray(cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB))
-        imgtk = ImageTk.PhotoImage(image=img)
-        face_label.imgtk = imgtk
-        face_label.configure(image=imgtk)
-        face_label.update()
-        time.sleep(0.03)
+# ---------------- LOCK CONTROL ----------------
+def open_lock(method="WEB", identifier="Admin"):
+    global lock_open
+    if not lock_open:
+        GPIO.output(RELAY_GPIO, GPIO.HIGH)
+        lock_open = True
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_entry(method, identifier, open_time=ts)
+        print(f"🔓 Lock opened by {identifier}")
+        update_status_to_thingspeak("OPEN")
 
-    cap.release()
+def close_lock(method="WEB", identifier="Admin"):
+    global lock_open
+    if lock_open:
+        GPIO.output(RELAY_GPIO, GPIO.LOW)
+        lock_open = False
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_entry(method, identifier, close_time=ts)
+        print(f"🔒 Lock closed by {identifier}")
+        update_status_to_thingspeak("CLOSED")
 
-# ---------------- RFID DETECTION ----------------
-def detect_rfid(status_label, tick_label):
-    status_label.config(text="Reading...")
-    reader = SimpleMFRC522()
-    rfid_detected = False
+# ---------------- THINGSPEAK SYNC ----------------
+def update_status_to_thingspeak(status):
+    """Push current lock status to Field 3."""
+    try:
+        r = requests.post("https://api.thingspeak.com/update.json", data={
+            "api_key": WRITE_KEY,
+            f"field{FIELD_STATUS}": status
+        }, timeout=10)
+        if r.status_code == 200:
+            print(f"📡 Status uploaded: {status}")
+    except Exception as e:
+        print("⚠️ ThingSpeak update error:", e)
 
-    while not rfid_detected:
-        rfid_id, text = reader.read_no_block()
-        if rfid_id:
-            tag_name = text.strip() if text else str(rfid_id)
-            if auth_state["face_verified"] and auth_state["name"] == tag_name:
-                auth_state["rfid_verified"] = True
-                status_label.config(text=f"✅ RFID Verified ({tag_name})")
-                tick_label.config(text="✅")
-                log_event(RFID_CSV, tag_name, "RFID Detected")
-            else:
-                status_label.config(text="❌ RFID mismatch with Face")
-            rfid_detected = True
-        time.sleep(0.1)
+def fetch_command_from_thingspeak():
+    """Read latest command from Field 4."""
+    url = f"https://api.thingspeak.com/channels/{CHANNEL_ID}/fields/{FIELD_CMD}/last.json"
+    params = {"api_key": READ_KEY}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            cmd = str(data.get(f"field{FIELD_CMD}", "")).strip().upper()
+            return cmd
+    except Exception as e:
+        print("⚠️ Command fetch error:", e)
+    return ""
 
-# ---------------- RELAY CONTROL ----------------
-def open_relay_control(root_window):
-    if auth_state["face_verified"] and auth_state["rfid_verified"]:
-        relay_win = tk.Toplevel()
-        relay_win.title("Relay Control Panel")
-        relay_win.geometry("300x200")
-        relay_win.grab_set()
+def thingspeak_thread():
+    last_cmd = ""
+    while True:
+        cmd = fetch_command_from_thingspeak()
+        if cmd and cmd != last_cmd:
+            print(f"🖥️ Received command: {cmd}")
+            last_cmd = cmd
+            if cmd == "OPEN_ADMIN":
+                open_lock("WEB", "Admin")
+            elif cmd == "CLOSE_ADMIN":
+                close_lock("WEB", "Admin")
+        # update current GPIO status periodically
+        status = "OPEN" if GPIO.input(RELAY_GPIO) == GPIO.HIGH else "CLOSED"
+        update_status_to_thingspeak(status)
+        time.sleep(UPLOAD_INTERVAL)
 
-        def relay_on():
-            GPIO.output(RELAY_GPIO, GPIO.HIGH)
-            print("Relay ON")
+# ---------------- MAIN ----------------
+if __name__ == "__main__":
+    try:
+        print("🚀 ThingSpeak Lock Controller started")
+        update_status_to_thingspeak("CLOSED")
+        t = Thread(target=thingspeak_thread, daemon=True)
+        t.start()
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("🛑 Exiting...")
+    finally:
+        GPIO.output(RELAY_GPIO, GPIO.LOW)
+        update_status_to_thingspeak("CLOSED")
+        GPIO.cleanup()
 
-        def relay_off():
-            GPIO.output(RELAY_GPIO, GPIO.LOW)
-            print("Relay OFF")
-
-        tk.Label(relay_win, text=f"Welcome {auth_state['name']}", font=("Arial",12,"bold")).pack(pady=10)
-        tk.Button(relay_win, text="Relay ON", command=relay_on, width=15).pack(pady=5)
-        tk.Button(relay_win, text="Relay OFF", command=relay_off, width=15).pack(pady=5)
-
-        def on_close():
-            GPIO.output(RELAY_GPIO, GPIO.LOW)
-            auth_state["face_verified"] = False
-            auth_state["rfid_verified"] = False
-            auth_state["name"] = None
-            relay_win.destroy()
-
-        relay_win.protocol("WM_DELETE_WINDOW", on_close)
-        relay_win.mainloop()
-    else:
-        print("Both Face and RFID must be verified first.")
-
-# ---------------- GUI ----------------
-root = tk.Tk()
-root.title("Access Control System")
-root.geometry("700x450")
-
-# Navbar with date & time
-navbar = tk.Label(root, text="", bg="lightgrey", font=("Arial", 12))
-navbar.pack(fill=tk.X)
-def update_time():
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    navbar.config(text=f"Current Date & Time: {now}")
-    root.after(500, update_time)
-update_time()
-
-# Main frame with 2 sections
-main_frame = tk.Frame(root)
-main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-# Left Frame: Face Detection
-left_frame = tk.LabelFrame(main_frame, text="Face Detection", width=320, height=300)
-left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
-face_label = tk.Label(left_frame, bg="black")
-face_label.pack(pady=5, fill=tk.BOTH, expand=True)
-face_status_label = tk.Label(left_frame, text="Not Started")
-face_status_label.pack(pady=5)
-face_tick_label = tk.Label(left_frame, text="")
-face_tick_label.pack()
-tk.Button(left_frame, text="Start Face Detection", 
-          command=lambda: threading.Thread(target=detect_face, args=(face_label, face_status_label, face_tick_label)).start()).pack(pady=5)
-
-# Right Frame: RFID Detection
-right_frame = tk.LabelFrame(main_frame, text="RFID Detection", width=320, height=300)
-right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5, pady=5)
-rfid_status_label = tk.Label(right_frame, text="Not Started")
-rfid_status_label.pack(pady=20)
-rfid_tick_label = tk.Label(right_frame, text="")
-rfid_tick_label.pack()
-tk.Button(right_frame, text="Start RFID Detection", 
-          command=lambda: threading.Thread(target=detect_rfid, args=(rfid_status_label, rfid_tick_label)).start()).pack(pady=5)
-
-# Open Relay Control button
-tk.Button(root, text="Open Relay Control", command=lambda: open_relay_control(root), bg="green", fg="white").pack(pady=10)
-
-root.mainloop()
-
-GPIO.output(RELAY_GPIO, GPIO.LOW)
-GPIO.cleanup()
