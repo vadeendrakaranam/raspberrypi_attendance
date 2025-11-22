@@ -1,203 +1,136 @@
-import sys, os
-sys.path.insert(0, os.path.abspath("/home/project/Desktop/Att/lib"))
+#!/usr/bin/env python3
+# Smart Lock Launcher with Password Login
+
+import tkinter as tk
+from tkinter import messagebox
+import subprocess
+
+# ------------------------ PATHS ------------------------
+MAIN_PY_PATH = "/home/project/Desktop/Att/1.py"
+RFID_PY_PATH = "/home/project/Desktop/Att/rfid.py"
+FACE_PY_PATH = "/home/project/Desktop/Att/face.py"
+
+AUTO_RETURN_TIME = 120  # 2 minutes
+PASSWORD = "1234"       # ---- SET YOUR PASSWORD HERE ----
 
 
-
-import cv2
-import dlib
-import numpy as np
-import pandas as pd
-import datetime
-import time
-import os
-import sqlite3
-import RPi.GPIO as GPIO
-from mfrc522 import SimpleMFRC522
-from threading import Thread, Lock
-
-# ---------------- GPIO ----------------
-RELAY_PIN = 11
-GPIO.setmode(GPIO.BOARD)
-GPIO.setup(RELAY_PIN, GPIO.OUT)
-GPIO.output(RELAY_PIN, GPIO.LOW)
-
-# ---------------- LOG ----------------
-LOG_FILE = "access_log.csv"
-log_mutex = Lock()
-
-def create_csv():
-    df = pd.DataFrame(columns=["Method","Identifier","Open Timestamp","Close Timestamp"])
-    df.to_csv(LOG_FILE,index=False)
-
-def check_csv_age():
-    if not os.path.exists(LOG_FILE):
-        create_csv()
-    else:
-        last_modified = datetime.datetime.fromtimestamp(os.path.getmtime(LOG_FILE))
-        if (datetime.datetime.now() - last_modified).days >= 50:
-            create_csv()
-
-check_csv_age()
-
-def log_detection(method, identifier, open_time="", close_time=""):
-    with log_mutex:
-        df = pd.read_csv(LOG_FILE)
-        mask = (df["Method"]==method) & (df["Identifier"]==identifier) & (df["Close Timestamp"]=="")
-        if mask.any():
-            idx = df[mask].index[-1]
-            if close_time:
-                df.at[idx,"Close Timestamp"] = close_time
-        else:
-            df = pd.concat([df,pd.DataFrame([[method,identifier,open_time,close_time]],columns=df.columns)],ignore_index=True)
-        df.to_csv(LOG_FILE,index=False)
-
-# ---------------- FACE SETUP ----------------
-detector = dlib.get_frontal_face_detector()
-predictor = dlib.shape_predictor('data/data_dlib/shape_predictor_68_face_landmarks.dat')
-face_rec_model = dlib.face_recognition_model_v1('data/data_dlib/dlib_face_recognition_resnet_model_v1.dat')
-
-def load_face_db():
-    names, features = [], []
-    if os.path.exists("data/features_all.csv"):
-        df = pd.read_csv("data/features_all.csv", header=None)
-        for i in range(df.shape[0]):
-            names.append(df.iloc[i][0])
-            features.append([df.iloc[i][j] for j in range(1,129)])
-    return names, features
-
-known_names, known_features = load_face_db()
-
-# ---------------- RFID SETUP ----------------
-reader = SimpleMFRC522()
-
-def init_rfid_db():
-    conn = sqlite3.connect('rfid_data.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS rfid_users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tag_id TEXT UNIQUE,
-            name TEXT
-        )''')
-    conn.commit()
-    conn.close()
-
-def load_rfid_tags():
-    tags = {}
-    conn = sqlite3.connect('rfid_data.db')
-    cursor = conn.cursor()
-    for tag_id, name in cursor.execute("SELECT tag_id, name FROM rfid_users").fetchall():
-        tags[int(tag_id)] = name
-    conn.close()
-    return tags
-
-init_rfid_db()
-registered_tags = load_rfid_tags()
-
-# ---------------- LOCK CONTROL ----------------
-lock_open = False
-current_user = None
-last_open_time = 0
-ignore_time = 10  # seconds cooldown
-
-def open_lock(identifier):
-    global lock_open, current_user, last_open_time
-    if not lock_open:
-        GPIO.output(RELAY_PIN, GPIO.HIGH)
-        lock_open = True
-        current_user = identifier
-        last_open_time = time.time()
-        log_detection(identifier.split(":")[0], identifier, open_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        print(f"🔓 Lock opened by {identifier}")
-
-def close_lock(identifier):
-    global lock_open, current_user
-    if lock_open and current_user==identifier and (time.time()-last_open_time)>=ignore_time:
-        GPIO.output(RELAY_PIN, GPIO.LOW)
-        lock_open = False
-        log_detection(identifier.split(":")[0], identifier, close_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        print(f"🔒 Lock closed by {identifier}")
-        current_user = None
-
-# ---------------- SYNC LOCK STATE ON START ----------------
-if os.path.exists(LOG_FILE):
-    df = pd.read_csv(LOG_FILE)
-    if not df.empty:
-        last_row = df.iloc[-1]
-        if last_row['Close Timestamp']=="":
-            GPIO.output(RELAY_PIN, GPIO.HIGH)
-            lock_open = True
-            current_user = f"{last_row['Method']}:{last_row['Identifier']}"
-            last_open_time = time.time()
-            print(f"🔓 Lock opened on startup by {current_user}")
-        else:
-            GPIO.output(RELAY_PIN, GPIO.LOW)
-            print("🔒 Lock closed on startup")
-else:
-    create_csv()
-    GPIO.output(RELAY_PIN, GPIO.LOW)
-
-# ---------------- FACE THREAD ----------------
-def face_thread():
-    global lock_open, current_user, last_open_time
-    cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,320)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT,240)
-    font = cv2.FONT_HERSHEY_SIMPLEX
-
-    while True:
-        ret, frame = cap.read()
-        if not ret: continue
-        faces = detector(frame,0)
-        for face in faces:
-            shape = predictor(frame, face)
-            feature = face_rec_model.compute_face_descriptor(frame,shape)
-            identifier = "Unknown"
-            if known_features:
-                distances = [np.linalg.norm(np.array(feature)-np.array(f)) for f in known_features]
-                if min(distances)<0.6:
-                    identifier = known_names[distances.index(min(distances))]
-            if identifier!="Unknown":
-                identifier_full = f"FACE:{identifier}"
-                if not lock_open:
-                    open_lock(identifier_full)
-                else:
-                    close_lock(identifier_full)
-            else:
-                log_detection("FACE","Unknown")  # only log
-        cv2.imshow("Face Access", frame)
-        if cv2.waitKey(1)&0xFF==ord('q'): break
-        time.sleep(0.05)
-    cap.release()
-    cv2.destroyAllWindows()
-
-# ---------------- RFID THREAD ----------------
-def rfid_thread():
-    global lock_open, current_user, last_open_time
-    while True:
-        uid, _ = reader.read_no_block()
-        if uid:
-            if uid in registered_tags:
-                identifier = f"RFID:{registered_tags[uid]}({uid})"
-                if not lock_open:
-                    open_lock(identifier)
-                else:
-                    close_lock(identifier)
-            else:
-                log_detection("RFID","Unknown")
-        time.sleep(0.1)
-
-# ---------------- MAIN ----------------
-if __name__=="__main__":
+# ------------------------ MODULE LAUNCHER ------------------------
+def run_module(path, name):
     try:
-        t1 = Thread(target=face_thread)
-        t2 = Thread(target=rfid_thread)
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
-    except KeyboardInterrupt:
-        print("Exiting...")
-    finally:
-        GPIO.output(RELAY_PIN, GPIO.LOW)
-        GPIO.cleanup()
+        subprocess.Popen(["python3", path])
+    except Exception as e:
+        messagebox.showerror("Error", f"Failed to launch {name}:\n{e}")
+
+
+# ------------------------ LOGIN WINDOW ------------------------
+class LoginWindow:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Login")
+        self.root.configure(bg="#1E1E2E")
+
+        self.root.attributes("-fullscreen", True)
+
+        frame = tk.Frame(root, bg="#1E1E2E")
+        frame.pack(expand=True)
+
+        tk.Label(frame, text="Enter Password",
+                 font=("Arial", 22, "bold"), fg="#FFD369", bg="#1E1E2E").pack(pady=20)
+
+        self.pwd_entry = tk.Entry(frame, show="*", font=("Arial", 18), width=20)
+        self.pwd_entry.pack(pady=10)
+        self.pwd_entry.focus()
+
+        tk.Button(frame, text="Login", font=("Arial", 16, "bold"),
+                  bg="#4ECCA3", fg="white",
+                  command=self.check_password,
+                  width=12, height=1).pack(pady=30)
+
+        # Allow Enter key to submit
+        self.root.bind("<Return>", self.check_password)
+
+    def check_password(self, event=None):
+        if self.pwd_entry.get() == PASSWORD:
+            self.root.destroy()
+
+            # Open launcher
+            launcher_root = tk.Tk()
+            app = LauncherApp(launcher_root)
+            launcher_root.mainloop()
+        else:
+            messagebox.showerror("Error", "Incorrect Password!")
+            self.pwd_entry.delete(0, tk.END)
+
+
+# ------------------------ LAUNCHER APP ------------------------
+class LauncherApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("🔒 Sentinel Smart Lock Launcher")
+        self.root.configure(bg="#1E1E2E")
+
+        self.root.attributes("-fullscreen", True)
+        self.root.focus_force()
+        self.root.bind("<Escape>", lambda e: self.root.attributes("-fullscreen", False))
+
+        self.frame = tk.Frame(root, bg="#1E1E2E")
+        self.frame.pack(expand=True, fill="both")
+
+        self.show_main_buttons()
+
+        self.auto_return_id = self.root.after(AUTO_RETURN_TIME * 1000, self.return_home)
+
+    def show_main_buttons(self):
+        for widget in self.frame.winfo_children():
+            widget.destroy()
+
+        tk.Label(self.frame, text="Sentinel Smart Lock Launcher",
+                 font=("Helvetica", 24, "bold"), fg="#FFD369", bg="#1E1E2E").pack(pady=(40,20))
+
+        button_style = {
+            "font": ("Arial", 16, "bold"),
+            "fg": "white",
+            "activeforeground": "white",
+            "relief": "flat",
+            "width": 25,
+            "height": 2,
+            "bd": 0,
+            "cursor": "hand2",
+        }
+
+        tk.Button(self.frame, text="🔑 RFID MODULE",
+                  command=lambda: run_module(RFID_PY_PATH, "RFID Module"),
+                  bg="#4ECCA3", activebackground="#45B38F", **button_style).pack(pady=20)
+
+        tk.Button(self.frame, text="👁 FACE RECOGNITION",
+                  command=lambda: run_module(FACE_PY_PATH, "Face Recognition"),
+                  bg="#4ECCA3", activebackground="#45B38F", **button_style).pack(pady=20)
+
+        tk.Button(self.frame, text="Go to Home",
+                  command=self.terminate_and_go_main,
+                  bg="#FF4444", activebackground="#CC0000", **button_style).pack(pady=20)
+
+        self.frame.bind_all("<Button-1>", self.reset_timer)
+        self.frame.bind_all("<Key>", self.reset_timer)
+
+    def return_home(self, event=None):
+        self.root.destroy()
+        subprocess.Popen(["python3", MAIN_PY_PATH])
+
+    def terminate_and_go_main(self):
+        if self.auto_return_id:
+            self.root.after_cancel(self.auto_return_id)
+        self.root.destroy()
+        subprocess.Popen(["python3", MAIN_PY_PATH])
+
+    def reset_timer(self, event=None):
+        if self.auto_return_id:
+            self.root.after_cancel(self.auto_return_id)
+        self.auto_return_id = self.root.after(AUTO_RETURN_TIME * 1000, self.return_home)
+
+
+# ------------------------ START PROGRAM ------------------------
+if __name__ == "__main__":
+    root = tk.Tk()
+    LoginWindow(root)
+    root.mainloop()
