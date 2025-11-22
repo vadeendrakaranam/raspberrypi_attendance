@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Smart Lock Launcher with Password Login
+# Smart Lock Launcher with Manual Password Login
 
 import tkinter as tk
 from tkinter import messagebox
@@ -11,8 +11,7 @@ RFID_PY_PATH = "/home/project/Desktop/Att/rfid.py"
 FACE_PY_PATH = "/home/project/Desktop/Att/face.py"
 
 AUTO_RETURN_TIME = 120  # 2 minutes
-PASSWORD = "1234"       # ---- SET YOUR PASSWORD HERE ----
-
+PASSWORD = "1234"       # ---- SET YOUR PASSWORD ----
 
 # ------------------------ MODULE LAUNCHER ------------------------
 def run_module(path, name):
@@ -28,7 +27,6 @@ class LoginWindow:
         self.root = root
         self.root.title("Login")
         self.root.configure(bg="#1E1E2E")
-
         self.root.attributes("-fullscreen", True)
 
         frame = tk.Frame(root, bg="#1E1E2E")
@@ -37,8 +35,10 @@ class LoginWindow:
         tk.Label(frame, text="Enter Password",
                  font=("Arial", 22, "bold"), fg="#FFD369", bg="#1E1E2E").pack(pady=20)
 
+        # Entry starts empty and will stay empty
         self.pwd_entry = tk.Entry(frame, show="*", font=("Arial", 18), width=20)
         self.pwd_entry.pack(pady=10)
+        self.pwd_entry.delete(0, tk.END)
         self.pwd_entry.focus()
 
         tk.Button(frame, text="Login", font=("Arial", 16, "bold"),
@@ -46,13 +46,20 @@ class LoginWindow:
                   command=self.check_password,
                   width=12, height=1).pack(pady=30)
 
-        # Allow Enter key to submit
-        self.root.bind("<Return>", self.check_password)
+        # Only allow Enter key if user typed something
+        self.root.bind("<Return>", self.check_enter_key)
 
-    def check_password(self, event=None):
-        if self.pwd_entry.get() == PASSWORD:
+    def check_enter_key(self, event=None):
+        # Only check password if user typed something
+        if self.pwd_entry.get().strip() != "":
+            self.check_password()
+        else:
+            messagebox.showwarning("Warning", "Please enter password first!")
+
+    def check_password(self):
+        entered = self.pwd_entry.get()
+        if entered == PASSWORD:
             self.root.destroy()
-
             # Open launcher
             launcher_root = tk.Tk()
             app = LauncherApp(launcher_root)
@@ -60,6 +67,7 @@ class LoginWindow:
         else:
             messagebox.showerror("Error", "Incorrect Password!")
             self.pwd_entry.delete(0, tk.END)
+            self.pwd_entry.focus()
 
 
 # ------------------------ LAUNCHER APP ------------------------
@@ -68,7 +76,6 @@ class LauncherApp:
         self.root = root
         self.root.title("🔒 Sentinel Smart Lock Launcher")
         self.root.configure(bg="#1E1E2E")
-
         self.root.attributes("-fullscreen", True)
         self.root.focus_force()
         self.root.bind("<Escape>", lambda e: self.root.attributes("-fullscreen", False))
@@ -77,7 +84,6 @@ class LauncherApp:
         self.frame.pack(expand=True, fill="both")
 
         self.show_main_buttons()
-
         self.auto_return_id = self.root.after(AUTO_RETURN_TIME * 1000, self.return_home)
 
     def show_main_buttons(self):
