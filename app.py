@@ -37,8 +37,8 @@ COOLDOWN_FILE = "cooldown.json"
 MASTER_TAG = "769839607204"
 MASTER_NAME = "Universal"
 RELAY_GPIO = 11
-TOGGLE_COOLDOWN = 10
-GUI_DETECT_TIMEOUT = 1  # seconds to show detection
+TOGGLE_COOLDOWN = 12   # 12 seconds cooldown per user
+GUI_DETECT_TIMEOUT = 1
 CAM_TRY_INDICES = list(range(0, 5))
 CAM_WIDTH = 640
 CAM_HEIGHT = 480
@@ -50,7 +50,7 @@ frame_mutex = Lock()
 
 lock_open = False
 current_user = None
-user_last_toggle = {}   # tracks per-user toggle times
+user_last_toggle = {}   # tracks per-user last action time
 active_rfid = {"text": "None", "last_seen": 0}
 active_face = {"text": "None", "last_seen": 0}
 unknown_last_seen = {}  # rate-limit unknown logs
@@ -66,7 +66,7 @@ gpio_setup()
 
 # ---------------- Logging ----------------
 def log_sentence(method, identifier, action):
-    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
     sentence = f"{ts}: {action} by {method} user {identifier}."
     with csv_mutex:
         with open(LOG_FILE, "a") as f:
@@ -95,6 +95,11 @@ load_cooldown()
 # ---------------- Lock Control ----------------
 def open_lock(method, identifier):
     global lock_open, current_user
+    now = time.time()
+    last = user_last_toggle.get(identifier, 0)
+    if now - last < TOGGLE_COOLDOWN:
+        return False  # cooldown not finished
+
     with lock_mutex:
         if not lock_open:
             if GPIO:
@@ -102,19 +107,26 @@ def open_lock(method, identifier):
                 except: pass
             lock_open = True
             current_user = identifier
+            user_last_toggle[identifier] = now
             log_sentence(method, identifier, "Lock opened")
             return True
     return False
 
-def close_lock():
+def close_lock(method, identifier):
     global lock_open, current_user
+    now = time.time()
+    last = user_last_toggle.get(identifier, 0)
+    if now - last < TOGGLE_COOLDOWN:
+        return False  # cooldown not finished
+
     with lock_mutex:
-        if lock_open and current_user:
+        if lock_open and current_user == identifier:
             if GPIO:
                 try: GPIO.output(RELAY_GPIO, GPIO.LOW)
                 except: pass
-            log_sentence("SYSTEM", current_user, "Lock closed")
             lock_open = False
+            user_last_toggle[identifier] = now
+            log_sentence(method, identifier, "Lock closed")
             current_user = None
             return True
     return False
@@ -129,21 +141,17 @@ if SimpleMFRC522:
         print("RFID init failed")
 
 def handle_rfid_detection(tag_id):
-    global lock_open, current_user
-    now = time.time()
     tag_str = str(tag_id)
     identifier = None
+    now = time.time()
 
     # Master key
     if tag_str == MASTER_TAG:
         identifier = MASTER_NAME
-        last_toggle = user_last_toggle.get(identifier, 0)
-        if now - last_toggle >= 0:
-            if lock_open:
-                close_lock()
-            else:
-                open_lock("RFID", identifier)
-            user_last_toggle[identifier] = now
+        if not lock_open:
+            open_lock("RFID", identifier)
+        else:
+            close_lock("RFID", identifier)
         active_rfid["text"] = identifier
         active_rfid["last_seen"] = now
         return
@@ -159,7 +167,6 @@ def handle_rfid_detection(tag_id):
         res = None
 
     if not res:
-        # Unknown tag: rate-limit logging
         last_seen = unknown_last_seen.get(tag_str, 0)
         if now - last_seen > 5:
             unknown_last_seen[tag_str] = now
@@ -174,19 +181,12 @@ def handle_rfid_detection(tag_id):
     active_rfid["text"] = identifier
     active_rfid["last_seen"] = now
 
-    last_toggle = user_last_toggle.get(identifier, 0)
-    if now - last_toggle < TOGGLE_COOLDOWN:
-        return
-
-    if lock_open:
-        if current_user == identifier:
-            close_lock()
-        else:
-            log_sentence("RFID", identifier, "Detected")
-    else:
+    if not lock_open:
         open_lock("RFID", identifier)
-
-    user_last_toggle[identifier] = now
+    elif current_user == identifier:
+        close_lock("RFID", identifier)
+    else:
+        log_sentence("RFID", identifier, "Detected")
 
 def rfid_thread_loop(stop_event: Event):
     if reader is None:
@@ -220,7 +220,6 @@ def load_face_db():
 load_face_db()
 
 def handle_face_detection(name):
-    global lock_open, current_user
     now = time.time()
     identifier = name if name != "Unknown" else "Unknown"
     active_face["text"] = identifier
@@ -234,19 +233,12 @@ def handle_face_detection(name):
             log_sentence("FACE", identifier, "Detected")
         return
 
-    last_toggle = user_last_toggle.get(identifier, 0)
-    if now - last_toggle < TOGGLE_COOLDOWN:
-        return
-
-    if lock_open:
-        if current_user == identifier:
-            close_lock()
-        else:
-            log_sentence("FACE", identifier, "Detected")
-    else:
+    if not lock_open:
         open_lock("FACE", identifier)
-
-    user_last_toggle[identifier] = now
+    elif current_user == identifier:
+        close_lock("FACE", identifier)
+    else:
+        log_sentence("FACE", identifier, "Detected")
 
 def face_thread_loop(stop_event: Event):
     global frame
@@ -360,7 +352,7 @@ class SentinelGUI:
                                  command=self.on_add_user)
         self.add_btn.pack(pady=(20, 20))
 
-        self.footer = tk.Label(root, text="Developed by Vadeendra Karanam",
+        self.footer = tk.Label(root, text="Developed by Vadeendra Karanam [CSE-IoT 2026 Batch]",
                                font=("Helvetica", 14), bg="#071428", fg="#9FB9BE")
         self.footer.pack(side="bottom", pady=8)
 
@@ -377,7 +369,7 @@ class SentinelGUI:
             self.root.geometry("900x600+100+100")
 
     def update_clock(self):
-        self.time_label.config(text=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        self.time_label.config(text=datetime.datetime.now().strftime("%Y-%m-%d %I:%M:%S %p"))
         if not self.stop_event.is_set():
             self.root.after(1000, self.update_clock)
 
@@ -397,7 +389,6 @@ class SentinelGUI:
 
     def update_status(self):
         now = time.time()
-        # Clear detection if timeout
         if now - active_rfid["last_seen"] > GUI_DETECT_TIMEOUT:
             active_rfid["text"] = "None"
         if now - active_face["last_seen"] > GUI_DETECT_TIMEOUT:
