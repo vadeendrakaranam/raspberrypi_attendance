@@ -38,21 +38,21 @@ MASTER_TAG = "769839607204"
 MASTER_NAME = "Universal"
 RELAY_GPIO = 11
 TOGGLE_COOLDOWN = 10
+GUI_DETECT_TIMEOUT = 1  # seconds to show detection
 CAM_TRY_INDICES = list(range(0, 5))
 CAM_WIDTH = 640
 CAM_HEIGHT = 480
 
 # ---------------- STATE ----------------
 csv_mutex = Lock()
-cooldown_mutex = Lock()
 lock_mutex = Lock()
 frame_mutex = Lock()
 
 lock_open = False
 current_user = None
 user_last_toggle = {}   # tracks per-user toggle times
-active_rfid = {"text": "None"}
-active_face = {"text": "None"}
+active_rfid = {"text": "None", "last_seen": 0}
+active_face = {"text": "None", "last_seen": 0}
 unknown_last_seen = {}  # rate-limit unknown logs
 
 # ---------------- GPIO Setup ----------------
@@ -65,7 +65,7 @@ def gpio_setup():
 gpio_setup()
 
 # ---------------- Logging ----------------
-def log_entry_sentence(method, identifier, action):
+def log_sentence(method, identifier, action):
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     sentence = f"{ts}: {action} by {method} user {identifier}."
     with csv_mutex:
@@ -75,7 +75,7 @@ def log_entry_sentence(method, identifier, action):
 
 # ---------------- Cooldown ----------------
 def save_cooldown():
-    with cooldown_mutex:
+    with Lock():
         try:
             with open(COOLDOWN_FILE, "w") as f:
                 json.dump(user_last_toggle, f)
@@ -102,7 +102,7 @@ def open_lock(method, identifier):
                 except: pass
             lock_open = True
             current_user = identifier
-            log_entry_sentence(method, identifier, "Lock opened")
+            log_sentence(method, identifier, "Lock opened")
             return True
     return False
 
@@ -113,7 +113,7 @@ def close_lock():
             if GPIO:
                 try: GPIO.output(RELAY_GPIO, GPIO.LOW)
                 except: pass
-            log_entry_sentence("SYSTEM", current_user, "Lock closed")
+            log_sentence("SYSTEM", current_user, "Lock closed")
             lock_open = False
             current_user = None
             return True
@@ -144,6 +144,8 @@ def handle_rfid_detection(tag_id):
             else:
                 open_lock("RFID", identifier)
             user_last_toggle[identifier] = now
+        active_rfid["text"] = identifier
+        active_rfid["last_seen"] = now
         return
 
     # Check DB
@@ -157,32 +159,32 @@ def handle_rfid_detection(tag_id):
         res = None
 
     if not res:
-        # Unknown tag: only log rate-limited
+        # Unknown tag: rate-limit logging
         last_seen = unknown_last_seen.get(tag_str, 0)
         if now - last_seen > 5:
             unknown_last_seen[tag_str] = now
             active_rfid["text"] = f"Unknown({tag_str})"
-            log_entry_sentence("RFID", f"Unknown({tag_str})", "Detected")
+            active_rfid["last_seen"] = now
+            log_sentence("RFID", f"Unknown({tag_str})", "Detected")
         return
 
     # Known user
     name = res[0]
     identifier = f"{name}({tag_str})"
     active_rfid["text"] = identifier
+    active_rfid["last_seen"] = now
 
     last_toggle = user_last_toggle.get(identifier, 0)
     if now - last_toggle < TOGGLE_COOLDOWN:
-        return  # still in cooldown
+        return
 
     if lock_open:
         if current_user == identifier:
             close_lock()
-            log_entry_sentence("RFID", identifier, "Lock closed")
         else:
-            log_entry_sentence("RFID", identifier, "Detected")
+            log_sentence("RFID", identifier, "Detected")
     else:
         open_lock("RFID", identifier)
-        log_entry_sentence("RFID", identifier, "Lock opened")
 
     user_last_toggle[identifier] = now
 
@@ -222,13 +224,14 @@ def handle_face_detection(name):
     now = time.time()
     identifier = name if name != "Unknown" else "Unknown"
     active_face["text"] = identifier
+    active_face["last_seen"] = now
 
     # Rate-limit unknown face logs
     if name == "Unknown":
         last_seen = unknown_last_seen.get("FACE_UNKNOWN", 0)
         if now - last_seen > 5:
             unknown_last_seen["FACE_UNKNOWN"] = now
-            log_entry_sentence("FACE", identifier, "Detected")
+            log_sentence("FACE", identifier, "Detected")
         return
 
     last_toggle = user_last_toggle.get(identifier, 0)
@@ -238,12 +241,10 @@ def handle_face_detection(name):
     if lock_open:
         if current_user == identifier:
             close_lock()
-            log_entry_sentence("FACE", identifier, "Lock closed")
         else:
-            log_entry_sentence("FACE", identifier, "Detected")
+            log_sentence("FACE", identifier, "Detected")
     else:
         open_lock("FACE", identifier)
-        log_entry_sentence("FACE", identifier, "Lock opened")
 
     user_last_toggle[identifier] = now
 
@@ -395,6 +396,13 @@ class SentinelGUI:
             self.root.after(30, self.update_frame)
 
     def update_status(self):
+        now = time.time()
+        # Clear detection if timeout
+        if now - active_rfid["last_seen"] > GUI_DETECT_TIMEOUT:
+            active_rfid["text"] = "None"
+        if now - active_face["last_seen"] > GUI_DETECT_TIMEOUT:
+            active_face["text"] = "None"
+
         self.rfid_label.config(text=f"RFID Detected : {active_rfid['text']}")
         self.face_label.config(text=f"Face Detected : {active_face['text']}")
         lock_text = f"Lock Status   : {'Opened by ' + current_user if lock_open else 'Closed'}"
