@@ -33,32 +33,27 @@ except Exception:
 
 # ---------------- CONFIG ----------------
 LOG_FILE = "Logs.csv"
-COOLDOWN_TIME = 10  # seconds for toggle behavior
+COOLDOWN_FILE = "cooldown.json"
 MASTER_TAG = "769839607204"
 MASTER_NAME = "Universal"
 RELAY_GPIO = 11
-ADD_USER_TIMEOUT = 120
+TOGGLE_COOLDOWN = 10
 CAM_TRY_INDICES = list(range(0, 5))
 CAM_WIDTH = 640
 CAM_HEIGHT = 480
 
 # ---------------- STATE ----------------
 csv_mutex = Lock()
+cooldown_mutex = Lock()
 lock_mutex = Lock()
 frame_mutex = Lock()
+
 lock_open = False
 current_user = None
-
-gui_state = {
-    "face_text": "None",
-    "lock_status": "Closed",
-    "last_user_activity": time.time(),
-}
-
-active_rfid = {"text": ""}
-active_face = {"text": ""}
-
-user_last_toggle = {}  # Tracks last toggle per user for 10s toggle behavior
+user_last_toggle = {}   # tracks per-user toggle times
+active_rfid = {"text": "None"}
+active_face = {"text": "None"}
+unknown_last_seen = {}  # rate-limit unknown logs
 
 # ---------------- GPIO Setup ----------------
 def gpio_setup():
@@ -69,48 +64,60 @@ def gpio_setup():
         GPIO.output(RELAY_GPIO, GPIO.LOW)
 gpio_setup()
 
+# ---------------- Logging ----------------
+def log_entry_sentence(method, identifier, action):
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    sentence = f"{ts}: {action} by {method} user {identifier}."
+    with csv_mutex:
+        with open(LOG_FILE, "a") as f:
+            f.write(sentence + "\n")
+    print(sentence)
+
+# ---------------- Cooldown ----------------
+def save_cooldown():
+    with cooldown_mutex:
+        try:
+            with open(COOLDOWN_FILE, "w") as f:
+                json.dump(user_last_toggle, f)
+        except Exception as e:
+            print("Error saving cooldown:", e)
+
+def load_cooldown():
+    global user_last_toggle
+    if os.path.exists(COOLDOWN_FILE):
+        try:
+            with open(COOLDOWN_FILE, "r") as f:
+                user_last_toggle = json.load(f)
+        except Exception:
+            user_last_toggle = {}
+load_cooldown()
+
 # ---------------- Lock Control ----------------
 def open_lock(method, identifier):
     global lock_open, current_user
     with lock_mutex:
         if not lock_open:
             if GPIO:
-                try:
-                    GPIO.output(RELAY_GPIO, GPIO.HIGH)
-                except Exception:
-                    pass
+                try: GPIO.output(RELAY_GPIO, GPIO.HIGH)
+                except: pass
             lock_open = True
             current_user = identifier
-            gui_state["lock_status"] = f"Opened by {method}: {identifier}"
-            gui_state["last_user_activity"] = time.time()
-            print(f"🔓 Lock opened by {method}: {identifier}")
+            log_entry_sentence(method, identifier, "Lock opened")
             return True
-        return False
+    return False
 
 def close_lock():
     global lock_open, current_user
     with lock_mutex:
-        if lock_open:
+        if lock_open and current_user:
             if GPIO:
-                try:
-                    GPIO.output(RELAY_GPIO, GPIO.LOW)
-                except Exception:
-                    pass
-            print(f"🔒 Lock closed by {current_user}")
+                try: GPIO.output(RELAY_GPIO, GPIO.LOW)
+                except: pass
+            log_entry_sentence("SYSTEM", current_user, "Lock closed")
             lock_open = False
-            gui_state["lock_status"] = "Closed"
-            gui_state["last_user_activity"] = time.time()
             current_user = None
             return True
-        return False
-
-# ---------------- Logging ----------------
-def log_entry_sentence(method, identifier, action):
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    sentence = f"{now}: {action} by {method} user {identifier}."
-    with csv_mutex:
-        with open(LOG_FILE, "a") as f:
-            f.write(sentence + "\n")
+    return False
 
 # ---------------- RFID ----------------
 reader = None
@@ -122,40 +129,57 @@ if SimpleMFRC522:
         print("RFID init failed")
 
 def handle_rfid_detection(tag_id):
-    global active_rfid, user_last_toggle
-    tag_str = str(tag_id)
+    global lock_open, current_user
     now = time.time()
+    tag_str = str(tag_id)
+    identifier = None
 
-    # Determine identifier
+    # Master key
     if tag_str == MASTER_TAG:
         identifier = MASTER_NAME
-    else:
-        try:
-            conn = sqlite3.connect("rfid_data.db")
-            cursor = conn.cursor()
-            cursor.execute("SELECT name FROM rfid_users WHERE tag_id=?", (tag_str,))
-            res = cursor.fetchone()
-            conn.close()
-        except Exception:
-            res = None
-
-        if not res:
-            active_rfid["text"] = f"Unknown({tag_str})"
-            log_entry_sentence("RFID", f"Unknown({tag_str})", "Detected")
-            return
-        identifier = f"{res[0]}({tag_str})"
-
-    active_rfid["text"] = identifier
-    gui_state["last_user_activity"] = now
-
-    # Toggle after 10s since last toggle
-    last = user_last_toggle.get(identifier, 0)
-    if now - last < COOLDOWN_TIME:
+        last_toggle = user_last_toggle.get(identifier, 0)
+        if now - last_toggle >= 0:
+            if lock_open:
+                close_lock()
+            else:
+                open_lock("RFID", identifier)
+            user_last_toggle[identifier] = now
         return
 
-    if lock_open and current_user == identifier:
-        close_lock()
-        log_entry_sentence("RFID", identifier, "Lock closed")
+    # Check DB
+    try:
+        conn = sqlite3.connect("rfid_data.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM rfid_users WHERE tag_id=?", (tag_str,))
+        res = cursor.fetchone()
+        conn.close()
+    except Exception:
+        res = None
+
+    if not res:
+        # Unknown tag: only log rate-limited
+        last_seen = unknown_last_seen.get(tag_str, 0)
+        if now - last_seen > 5:
+            unknown_last_seen[tag_str] = now
+            active_rfid["text"] = f"Unknown({tag_str})"
+            log_entry_sentence("RFID", f"Unknown({tag_str})", "Detected")
+        return
+
+    # Known user
+    name = res[0]
+    identifier = f"{name}({tag_str})"
+    active_rfid["text"] = identifier
+
+    last_toggle = user_last_toggle.get(identifier, 0)
+    if now - last_toggle < TOGGLE_COOLDOWN:
+        return  # still in cooldown
+
+    if lock_open:
+        if current_user == identifier:
+            close_lock()
+            log_entry_sentence("RFID", identifier, "Lock closed")
+        else:
+            log_entry_sentence("RFID", identifier, "Detected")
     else:
         open_lock("RFID", identifier)
         log_entry_sentence("RFID", identifier, "Lock opened")
@@ -163,7 +187,6 @@ def handle_rfid_detection(tag_id):
     user_last_toggle[identifier] = now
 
 def rfid_thread_loop(stop_event: Event):
-    global active_rfid
     if reader is None:
         print("RFID reader not found.")
         return
@@ -172,13 +195,11 @@ def rfid_thread_loop(stop_event: Event):
             uid, _ = reader.read_no_block()
             if uid:
                 handle_rfid_detection(uid)
-            else:
-                active_rfid["text"] = ""
         except Exception:
             traceback.print_exc()
-        time.sleep(0.05)  # Fast loop for immediate detection
+        time.sleep(0.25)
 
-# ---------------- FACE ----------------
+# ---------------- Face ----------------
 detector = dlib.get_frontal_face_detector()
 predictor, face_model = None, None
 try:
@@ -196,15 +217,45 @@ def load_face_db():
             known_features.append([float(df.iloc[i, j]) for j in range(1, 129)])
 load_face_db()
 
+def handle_face_detection(name):
+    global lock_open, current_user
+    now = time.time()
+    identifier = name if name != "Unknown" else "Unknown"
+    active_face["text"] = identifier
+
+    # Rate-limit unknown face logs
+    if name == "Unknown":
+        last_seen = unknown_last_seen.get("FACE_UNKNOWN", 0)
+        if now - last_seen > 5:
+            unknown_last_seen["FACE_UNKNOWN"] = now
+            log_entry_sentence("FACE", identifier, "Detected")
+        return
+
+    last_toggle = user_last_toggle.get(identifier, 0)
+    if now - last_toggle < TOGGLE_COOLDOWN:
+        return
+
+    if lock_open:
+        if current_user == identifier:
+            close_lock()
+            log_entry_sentence("FACE", identifier, "Lock closed")
+        else:
+            log_entry_sentence("FACE", identifier, "Detected")
+    else:
+        open_lock("FACE", identifier)
+        log_entry_sentence("FACE", identifier, "Lock opened")
+
+    user_last_toggle[identifier] = now
+
 def face_thread_loop(stop_event: Event):
-    global frame, current_user, lock_open, active_face, user_last_toggle
+    global frame
     while not stop_event.is_set():
         if predictor is None or face_model is None or not known_features:
             time.sleep(0.5)
             continue
 
         with frame_mutex:
-            local = None if 'frame' not in globals() else (None if frame is None else frame.copy())
+            local = None if frame is None else frame.copy()
         if local is None:
             time.sleep(0.05)
             continue
@@ -213,7 +264,6 @@ def face_thread_loop(stop_event: Event):
             bgr = cv2.cvtColor(local, cv2.COLOR_RGB2BGR)
             faces = detector(bgr, 0)
             recognized = False
-
             for f in faces:
                 shape = predictor(bgr, f)
                 feat = np.array(face_model.compute_face_descriptor(bgr, shape))
@@ -221,32 +271,22 @@ def face_thread_loop(stop_event: Event):
 
                 if distances and min(distances) < 0.6:
                     name = known_names[int(np.argmin(distances))]
-                    identifier = name
-                    active_face["text"] = identifier
-                    gui_state["last_user_activity"] = time.time()
-                    recognized = True
+                else:
+                    name = "Unknown"
 
-                    now = time.time()
-                    last = user_last_toggle.get(identifier, 0)
-                    if now - last >= COOLDOWN_TIME:
-                        if lock_open and current_user == identifier:
-                            close_lock()
-                            log_entry_sentence("FACE", identifier, "Lock closed")
-                        else:
-                            open_lock("FACE", identifier)
-                            log_entry_sentence("FACE", identifier, "Lock opened")
-                        user_last_toggle[identifier] = now
-                    break
+                handle_face_detection(name)
+                recognized = True
+                break
 
             if not recognized:
-                active_face["text"] = ""
+                active_face["text"] = "None"
 
         except Exception:
             traceback.print_exc()
-        time.sleep(0.05)
 
-# ---------------- CAMERA ----------------
-camera_cap = None
+        time.sleep(0.12)
+
+# ---------------- Camera ----------------
 def camera_init_and_stream(stop_event: Event):
     global camera_cap, frame
     for idx in CAM_TRY_INDICES:
@@ -355,32 +395,26 @@ class SentinelGUI:
             self.root.after(30, self.update_frame)
 
     def update_status(self):
-        rfid_display = active_rfid["text"] if active_rfid["text"] else "None"
-        face_display = active_face["text"] if active_face["text"] else "None"
-        self.rfid_label.config(text=f"RFID Detected : {rfid_display}")
-        self.face_label.config(text=f"Face Detected : {face_display}")
-        self.lock_label.config(text=f"Lock Status   : {gui_state.get('lock_status', 'Closed')}")
+        self.rfid_label.config(text=f"RFID Detected : {active_rfid['text']}")
+        self.face_label.config(text=f"Face Detected : {active_face['text']}")
+        lock_text = f"Lock Status   : {'Opened by ' + current_user if lock_open else 'Closed'}"
+        self.lock_label.config(text=lock_text)
         if not self.stop_event.is_set():
             self.root.after(500, self.update_status)
 
     def on_add_user(self):
-        print("🧍 Add User pressed — terminating main GUI and launching add.py...")
         self.stop_event.set()
-        if camera_cap:
-            camera_cap.release()
-        if GPIO:
-            GPIO.output(RELAY_GPIO, GPIO.LOW)
+        if camera_cap: camera_cap.release()
+        if GPIO: GPIO.output(RELAY_GPIO, GPIO.LOW)
         self.root.destroy()
         subprocess.Popen([sys.executable, "/home/project/Desktop/Att/add.py"])
         os._exit(0)
 
     def on_close(self):
-        print("Exiting...")
         self.stop_event.set()
-        if camera_cap:
-            camera_cap.release()
-        if GPIO:
-            GPIO.output(RELAY_GPIO, GPIO.LOW)
+        save_cooldown()
+        if camera_cap: camera_cap.release()
+        if GPIO: GPIO.output(RELAY_GPIO, GPIO.LOW)
         self.root.destroy()
         os._exit(0)
 
