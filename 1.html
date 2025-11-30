@@ -1,209 +1,764 @@
-import sys, os
+#!/usr/bin/env python3
+# sentinel_smart_lock_full_gui.py
+# Full integrated GUI + RFID + Face + Lock + Embedded Machine Control Panel
+#
+# Behavior highlights:
+# - When a known RFID or face is detected, an embedded control panel appears inside the main GUI.
+# - Panel contains MACHINE ON, MACHINE OFF and CLOSE.
+# - Only the user who caused the panel to open may operate the machine buttons.
+# - CLOSE requires re-authentication: pressing CLOSE starts a short window during which the same user must present RFID/face again to confirm close.
+# - Unknown detections behave as before (log + email with photo).
+#
+# NOTE: Replace placeholder email credentials and model/data paths before running on the Pi.
+# Works in non-RPi development environment (GPIO & RFID optional).
+
+import sys
+import os
+
 sys.path.insert(0, os.path.abspath("/home/project/Desktop/Att/lib"))
 
-import dlib, numpy as np, cv2, pandas as pd, time, sqlite3, datetime
-import RPi.GPIO as GPIO
-from mfrc522 import SimpleMFRC522
+import time
+import datetime
+import json
+import sqlite3
+import traceback
+import subprocess
+from threading import Thread, Lock, Event
+
+import pandas as pd
+import numpy as np
+import cv2
+import dlib
 import tkinter as tk
-from tkinter import ttk
 from PIL import Image, ImageTk
 
-# --- Setup Dlib Models ---
-detector = dlib.get_frontal_face_detector()
-predictor = dlib.shape_predictor('data/data_dlib/shape_predictor_68_face_landmarks.dat')
-face_reco_model = dlib.face_recognition_model_v1("data/data_dlib/dlib_face_recognition_resnet_model_v1.dat")
+frame = None
+camera_cap = None  # global camera handle
 
-# --- Relay GPIO setup ---
-RELAY_GPIO = 11
-RELAY_ON, RELAY_OFF = GPIO.HIGH, GPIO.LOW
-GPIO.setmode(GPIO.BOARD)
-GPIO.setup(RELAY_GPIO, GPIO.OUT)
-GPIO.output(RELAY_GPIO, RELAY_OFF)
+# optionally available hardware libs
+try:
+    import RPi.GPIO as GPIO
+    from mfrc522 import SimpleMFRC522
+except Exception:
+    GPIO = None
+    SimpleMFRC522 = None
+    print("⚠ Running without GPIO/RFID hardware support.")
 
-# --- RFID setup ---
-reader = SimpleMFRC522()
+# ---------------- CONFIG ----------------
+LOG_FILE = "Logs.csv"
+COOLDOWN_FILE = "cooldown.json"
+MASTER_TAG = "769839607204"     # adjust as needed
+MASTER_NAME = "Universal"
+RELAY_GPIO = 11                 # lock relay gpio (BOARD numbering)
+MACHINE_GPIO = 13               # machine relay gpio (BOARD numbering)
+TOGGLE_COOLDOWN = 12            # seconds cooldown per user for lock toggle
+GUI_DETECT_TIMEOUT = 1.0        # seconds to show "Detected" in GUI
+CAM_TRY_INDICES = list(range(0, 5))
+CAM_WIDTH = 640
+CAM_HEIGHT = 480
 
-# --- Attendance database ---
-conn = sqlite3.connect("attendance.db")
-cursor = conn.cursor()
-cursor.execute("""CREATE TABLE IF NOT EXISTS attendance (
-    name TEXT, time TEXT, date DATE, UNIQUE(name, date))""")
-conn.commit()
-conn.close()
+# ---------------- STATE ----------------
+csv_mutex = Lock()
+lock_mutex = Lock()
+frame_mutex = Lock()
+panel_mutex = Lock()
 
-# --- Load RFID users ---
-def load_registered_rfid_tags():
-    tags = {}
-    conn = sqlite3.connect("rfid_tags.db")
-    cursor = conn.cursor()
-    cursor.execute("""CREATE TABLE IF NOT EXISTS rfid_users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        rfid_id INTEGER UNIQUE, name TEXT)""")
-    cursor.execute("SELECT rfid_id, name FROM rfid_users")
-    for rfid_id, name in cursor.fetchall():
-        tags[int(rfid_id)] = name
-    conn.close()
-    return tags
+lock_open = False
+current_user = None
+user_last_toggle = {}   # tracks per-user last action time
+active_rfid = {"text": "None", "last_seen": 0}
+active_face = {"text": "None", "last_seen": 0}
+unknown_last_seen = {}  # rate-limit unknown logs
 
+# panel / GUI instance globals
+panel_user = None       # identifier of user who opened panel
+gui_instance = None     # will hold SentinelGUI instance
+expecting_close = False
+expect_close_deadline = 0.0
 
-class FaceRFIDSystem:
-    def __init__(self, window):
-        self.window = window
-        self.window.title("Sentinel Smart Lock")
-        self.window.geometry("480x800")   # vertical window (width x height)
-        self.window.configure(bg="white")
+# ---------------- Email / Unknown Image Setup ----------------
+import smtplib
+from email.message import EmailMessage
+import ssl
 
-        # Fonts
-        title_font = ("Arial", 20, "bold")
-        time_font = ("Arial", 14)
+# PLACEHOLDERS — Replace these on the Pi (DO NOT share publicly)
+SENDER_EMAIL = "karanam.vadeendra123456@gmail.com"
+APP_PASSWORD = "ibae dfoh tdlo uoow"
+RECEIVER_EMAIL = "126158026@sastra.ac.in"
 
-        # Title
-        self.title_label = tk.Label(window, text="🔒 Sentinel Smart Lock",
-                                    font=title_font, fg="green", bg="white")
-        self.title_label.pack(pady=10)
+UNKNOWN_DIR = "unknown"
+os.makedirs(UNKNOWN_DIR, exist_ok=True)
 
-        # Time/Date
-        self.time_label = tk.Label(window, text="", font=time_font,
-                                   fg="black", bg="white")
-        self.time_label.pack(pady=5)
+def send_email_alert(subject, body, image_path):
+    try:
+        msg = EmailMessage()
+        msg["From"] = SENDER_EMAIL
+        msg["To"] = RECEIVER_EMAIL
+        msg["Subject"] = subject
+        msg.set_content(body)
 
-        # Camera Preview
-        self.video_label = tk.Label(window, bg="white")
-        self.video_label.pack(pady=20, expand=True)
-
-        # New Registration button
-        style = ttk.Style()
-        style.configure("TButton", font=("Arial", 14), padding=10)
-
-        self.reg_button = ttk.Button(window, text="➕ New Registration",
-                                     command=self.new_registration, style="TButton")
-        self.reg_button.pack(pady=20)
-
-        # Quit button (optional for debug)
-        self.quit_button = ttk.Button(window, text="❌ Exit",
-                                      command=self.on_closing, style="TButton")
-        self.quit_button.pack(side="bottom", pady=10)
-
-        # Init logic
-        self.font = cv2.FONT_HERSHEY_SIMPLEX
-        self.face_features_known_list, self.face_name_known_list = [], []
-        self.relay_triggered_time, self.relay_on = 0, False
-        self.rfid_tags = load_registered_rfid_tags()
-        self.last_rfid_id, self.last_rfid_time, self.rfid_cooldown = None, 0, 5
-
-        self.cap = cv2.VideoCapture(0)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
-
-        if not self.get_face_database():
-            print("❌ Face database not found.")
-            exit()
-
-        self.update_time()
-        self.update_frame()
-        self.window.protocol("WM_DELETE_WINDOW", self.on_closing)
-
-    # --- DB ---
-    def get_face_database(self):
-        if os.path.exists("data/features_all.csv"):
-            csv_rd = pd.read_csv("data/features_all.csv", header=None)
-            for i in range(csv_rd.shape[0]):
-                features = [csv_rd.iloc[i][j] for j in range(1, 129)]
-                self.face_name_known_list.append(csv_rd.iloc[i][0])
-                self.face_features_known_list.append(features)
-            return True
-        return False
-
-    def euclidean_distance(self, f1, f2):
-        return np.linalg.norm(np.array(f1) - np.array(f2))
-
-    def attendance(self, name):
-        current_date = datetime.datetime.now().strftime('%Y-%m-%d')
-        conn = sqlite3.connect("attendance.db")
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM attendance WHERE name = ? AND date = ?", (name, current_date))
-        if not cursor.fetchone():
-            current_time = datetime.datetime.now().strftime('%H:%M:%S')
-            cursor.execute("INSERT INTO attendance (name, time, date) VALUES (?, ?, ?)", (name, current_time, current_date))
-            conn.commit()
-            print(f"✅ {name} marked present at {current_time}")
-        conn.close()
-
-    # --- Frame Processing ---
-    def process_frame(self, frame):
-        known_detected = False
-        faces = detector(frame, 0)
-        for face in faces:
-            shape = predictor(frame, face)
-            face_feature = face_reco_model.compute_face_descriptor(frame, shape)
-            distances = [self.euclidean_distance(face_feature, f) for f in self.face_features_known_list]
-            if distances and min(distances) < 0.6:
-                name = self.face_name_known_list[distances.index(min(distances))]
-                self.attendance(name)
-                known_detected = True
-            else:
-                name = "unknown"
-            cv2.rectangle(frame, (face.left(), face.top()), (face.right(), face.bottom()), (0, 0, 0), 2)
-            cv2.putText(frame, name, (face.left(), face.top() - 10), self.font, 0.6, (0, 0, 0), 1)
-
-        # RFID check
+        # attach image if present
         try:
-            id, _ = reader.read_no_block()
-            now = time.time()
-            if id and id in self.rfid_tags:
-                if id != self.last_rfid_id or (now - self.last_rfid_time) > self.rfid_cooldown:
-                    rfid_name = self.rfid_tags[id]
-                    self.attendance(rfid_name)
-                    known_detected = True
-                    cv2.putText(frame, f"RFID: {rfid_name}", (10, 30), self.font, 0.7, (0, 128, 0), 2)
-                    print(f"🔑 RFID authorized: {rfid_name}")
-                    self.last_rfid_id, self.last_rfid_time = id, now
+            with open(image_path, "rb") as f:
+                img_data = f.read()
+            msg.add_attachment(img_data, maintype="image", subtype="jpeg",
+                               filename=os.path.basename(image_path))
+        except Exception as e:
+            print("Warning: failed to attach image:", e)
+
+        context = ssl.create_default_context()
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
+            server.login(SENDER_EMAIL, APP_PASSWORD)
+            server.send_message(msg)
+
+        try:
+            os.remove(image_path)
+        except Exception as e:
+            print("Warning: could not delete image:", e)
+
+        print(f"Email sent and image removed: {image_path}")
+
+    except Exception as e:
+        print("Email sending failed:", e)
+
+def capture_and_email(detect_type):
+    ts = datetime.datetime.now().strftime("%Y-%m-%d_%I-%M-%S_%p")
+    filename = f"{UNKNOWN_DIR}/unknown_{detect_type}_{ts}.jpg"
+
+    with frame_mutex:
+        local = None if frame is None else frame.copy()
+
+    if local is None:
+        print("No frame to capture")
+        return
+
+    try:
+        cv2.imwrite(filename, cv2.cvtColor(local, cv2.COLOR_RGB2BGR))
+    except Exception as e:
+        print("Failed saving image:", e)
+        return
+
+    subject = f"Unknown {detect_type} Detected - {datetime.datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}"
+    body = f"An unknown {detect_type.lower()} was detected on Sentinel Smart Lock.\nTime: {datetime.datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}"
+
+    send_email_alert(subject, body, filename)
+
+# ---------------- GPIO Setup ----------------
+def gpio_setup():
+    if GPIO:
+        try:
+            GPIO.setwarnings(False)
+            GPIO.setmode(GPIO.BOARD)
+            GPIO.setup(RELAY_GPIO, GPIO.OUT)
+            GPIO.output(RELAY_GPIO, GPIO.LOW)
+            GPIO.setup(MACHINE_GPIO, GPIO.OUT)
+            GPIO.output(MACHINE_GPIO, GPIO.LOW)
+            print("GPIO initialized.")
+        except Exception as e:
+            print("GPIO setup error:", e)
+    else:
+        print("GPIO not available - running in simulation mode.")
+
+gpio_setup()
+
+# ---------------- Logging ----------------
+def log_sentence(method, identifier, action):
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
+    sentence = f"{ts}: {action} by {method} user {identifier}."
+    with csv_mutex:
+        try:
+            with open(LOG_FILE, "a") as f:
+                f.write(sentence + "\n")
+        except Exception as e:
+            print("Failed writing log:", e)
+    print(sentence)
+
+# ---------------- Cooldown ----------------
+def save_cooldown():
+    with Lock():
+        try:
+            with open(COOLDOWN_FILE, "w") as f:
+                json.dump(user_last_toggle, f)
+        except Exception as e:
+            print("Error saving cooldown:", e)
+
+def load_cooldown():
+    global user_last_toggle
+    if os.path.exists(COOLDOWN_FILE):
+        try:
+            with open(COOLDOWN_FILE, "r") as f:
+                user_last_toggle = json.load(f)
         except Exception:
-            pass
+            user_last_toggle = {}
+load_cooldown()
 
-        # Relay
-        now = time.time()
-        if known_detected and not self.relay_on:
-            GPIO.output(RELAY_GPIO, RELAY_ON)
-            self.relay_triggered_time, self.relay_on = now, True
-            print("🔓 Relay ON")
-        if self.relay_on and (now - self.relay_triggered_time >= 10):
-            GPIO.output(RELAY_GPIO, RELAY_OFF)
-            self.relay_on = False
-            print("🔒 Relay OFF")
+# ---------------- Lock Control ----------------
+def open_lock(method, identifier):
+    global lock_open, current_user
+    now = time.time()
+    last = user_last_toggle.get(identifier, 0)
+    if now - last < TOGGLE_COOLDOWN:
+        return False  # cooldown not finished
 
-        return frame
+    with lock_mutex:
+        if not lock_open:
+            if GPIO:
+                try: GPIO.output(RELAY_GPIO, GPIO.HIGH)
+                except Exception: pass
+            lock_open = True
+            current_user = identifier
+            user_last_toggle[identifier] = now
+            log_sentence(method, identifier, "Lock opened")
+            return True
+    return False
 
-    # --- GUI Updates ---
-    def update_time(self):
-        now = datetime.datetime.now().strftime("%I:%M %p | %b %d, %Y")
-        self.time_label.config(text=now)
-        self.window.after(1000, self.update_time)
+def close_lock(method, identifier):
+    global lock_open, current_user
+    now = time.time()
+    last = user_last_toggle.get(identifier, 0)
+    if now - last < TOGGLE_COOLDOWN:
+        return False  # cooldown not finished
+
+    with lock_mutex:
+        if lock_open and current_user == identifier:
+            if GPIO:
+                try: GPIO.output(RELAY_GPIO, GPIO.LOW)
+                except Exception: pass
+            lock_open = False
+            user_last_toggle[identifier] = now
+            log_sentence(method, identifier, "Lock closed")
+            current_user = None
+            return True
+    return False
+
+# ---------------- RFID ----------------
+reader = None
+if SimpleMFRC522:
+    try:
+        reader = SimpleMFRC522()
+    except Exception:
+        reader = None
+        print("RFID init failed")
+
+def rfid_read_no_block():
+    """
+    Wrapper to try to read uid without blocking. Different hardware wrappers might have different APIs.
+    Adjust if necessary for your RFID library.
+    """
+    if reader is None:
+        return None, None
+    try:
+        uid, text = reader.read_no_block()  # original code used this
+        return uid, text
+    except Exception:
+        # fallback: some wrappers might require .read() blocking - do not call here
+        try:
+            uid = reader.read_id_no_block()
+            return uid, None
+        except Exception:
+            return None, None
+
+def handle_rfid_detection(tag_id):
+    global panel_user, expecting_close, expect_close_deadline
+    tag_str = str(tag_id)
+    identifier = None
+    now = time.time()
+
+    # Master key short-circuit
+    if tag_str == MASTER_TAG:
+        identifier = MASTER_NAME
+        if not lock_open:
+            open_lock("RFID", identifier)
+        else:
+            # only the same user can close; for master we allow toggle
+            if current_user == identifier:
+                close_lock("RFID", identifier)
+            else:
+                # if different current_user, ignore closing
+                pass
+        active_rfid["text"] = identifier
+        active_rfid["last_seen"] = now
+        return
+
+    # Check DB for known tag
+    try:
+        conn = sqlite3.connect("rfid_data.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM rfid_users WHERE tag_id=?", (tag_str,))
+        res = cursor.fetchone()
+        conn.close()
+    except Exception:
+        res = None
+
+    if not res:
+        # unknown tag
+        last_seen = unknown_last_seen.get(tag_str, 0)
+        if now - last_seen > 5:
+            unknown_last_seen[tag_str] = now
+            active_rfid["text"] = f"Unknown({tag_str})"
+            active_rfid["last_seen"] = now
+            log_sentence("RFID", f"Unknown({tag_str})", "Detected")
+            Thread(target=capture_and_email, args=("RFID",), daemon=True).start()
+        return
+
+    # Known user
+    name = res[0]
+    identifier = f"{name}({tag_str})"
+    active_rfid["text"] = identifier
+    active_rfid["last_seen"] = now
+
+    # First, if we are in close-auth mode expecting this user -> confirm close
+    with panel_mutex:
+        if expecting_close and panel_user == identifier:
+            expecting_close = False
+            expect_close_deadline = 0.0
+            if gui_instance:
+                gui_instance.hide_control_panel_authenticated(action_by=identifier)
+            return
+
+    # If no panel is open, open panel for this user and toggle lock as before
+    if not lock_open:
+        open_lock("RFID", identifier)
+    elif current_user == identifier:
+        close_lock("RFID", identifier)
+    else:
+        log_sentence("RFID", identifier, "Detected")
+
+    # Show control panel if available
+    with panel_mutex:
+        if gui_instance and panel_user is None:
+            gui_instance.show_control_panel(identifier)
+
+def rfid_thread_loop(stop_event: Event):
+    if reader is None:
+        print("RFID reader not found.")
+        return
+    while not stop_event.is_set():
+        try:
+            uid, _ = rfid_read_no_block()
+            if uid:
+                handle_rfid_detection(uid)
+        except Exception:
+            traceback.print_exc()
+        time.sleep(0.25)
+
+# ---------------- Face ----------------
+detector = dlib.get_frontal_face_detector()
+predictor, face_model = None, None
+try:
+    predictor = dlib.shape_predictor("data/data_dlib/shape_predictor_68_face_landmarks.dat")
+    face_model = dlib.face_recognition_model_v1("data/data_dlib/dlib_face_recognition_resnet_model_v1.dat")
+except Exception as e:
+    print("Face model error:", e)
+
+known_features, known_names = [], []
+def load_face_db():
+    if os.path.exists("data/features_all.csv"):
+        df = pd.read_csv("data/features_all.csv", header=None)
+        for i in range(df.shape[0]):
+            known_names.append(df.iloc[i, 0])
+            known_features.append([float(df.iloc[i, j]) for j in range(1, 129)])
+load_face_db()
+
+def handle_face_detection(name):
+    global panel_user, expecting_close, expect_close_deadline
+    now = time.time()
+    identifier = name if name != "Unknown" else "Unknown"
+    active_face["text"] = identifier
+    active_face["last_seen"] = now
+
+    if name == "Unknown":
+        last_seen = unknown_last_seen.get("FACE_UNKNOWN", 0)
+        if now - last_seen > 5:
+            unknown_last_seen["FACE_UNKNOWN"] = now
+            log_sentence("FACE", identifier, "Detected")
+            Thread(target=capture_and_email, args=("FACE",), daemon=True).start()
+        return
+
+    # name is known; we use name as identifier (ensure uniqueness if multiple same names)
+    identifier = name
+
+    # Confirm close if expecting_close and same person
+    with panel_mutex:
+        if expecting_close and panel_user == identifier:
+            expecting_close = False
+            expect_close_deadline = 0.0
+            if gui_instance:
+                gui_instance.hide_control_panel_authenticated(action_by=identifier)
+            return
+
+    # Normal flow: open/close lock based on presence
+    if not lock_open:
+        open_lock("FACE", identifier)
+    elif current_user == identifier:
+        close_lock("FACE", identifier)
+    else:
+        log_sentence("FACE", identifier, "Detected")
+
+    with panel_mutex:
+        if gui_instance and panel_user is None:
+            gui_instance.show_control_panel(identifier)
+
+def face_thread_loop(stop_event: Event):
+    global frame
+    while not stop_event.is_set():
+        if predictor is None or face_model is None or not known_features:
+            time.sleep(0.5)
+            continue
+
+        with frame_mutex:
+            local = None if frame is None else frame.copy()
+        if local is None:
+            time.sleep(0.05)
+            continue
+
+        try:
+            bgr = cv2.cvtColor(local, cv2.COLOR_RGB2BGR)
+            faces = detector(bgr, 0)
+            recognized = False
+            for f in faces:
+                shape = predictor(bgr, f)
+                feat = np.array(face_model.compute_face_descriptor(bgr, shape))
+                distances = [np.linalg.norm(feat - np.array(x)) for x in known_features]
+
+                if distances and min(distances) < 0.6:
+                    name = known_names[int(np.argmin(distances))]
+                else:
+                    name = "Unknown"
+
+                handle_face_detection(name)
+                recognized = True
+                break
+
+            if not recognized:
+                active_face["text"] = "None"
+
+        except Exception:
+            traceback.print_exc()
+
+        time.sleep(0.12)
+
+# ---------------- Camera ----------------
+def camera_init_and_stream(stop_event: Event):
+    global camera_cap, frame
+    for idx in CAM_TRY_INDICES:
+        try:
+            cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
+                camera_cap = cap
+                break
+            else:
+                cap.release()
+        except Exception:
+            continue
+    if camera_cap is None:
+        print("Camera not found / couldn't open.")
+        return
+
+    while not stop_event.is_set():
+        ret, img = camera_cap.read()
+        if ret:
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            with frame_mutex:
+                frame = rgb
+        time.sleep(0.03)
+
+    if camera_cap:
+        camera_cap.release()
+        camera_cap = None
+
+# ---------------- Machine control ----------------
+def machine_on(identifier=None):
+    who = identifier or panel_user or current_user or "Unknown"
+    print(f"MACHINE ON by {who}")
+    if GPIO:
+        try: GPIO.output(MACHINE_GPIO, GPIO.HIGH)
+        except Exception: pass
+    log_sentence("GUI", who, "Machine ON")
+
+def machine_off(identifier=None):
+    who = identifier or panel_user or current_user or "Unknown"
+    print(f"MACHINE OFF by {who}")
+    if GPIO:
+        try: GPIO.output(MACHINE_GPIO, GPIO.LOW)
+        except Exception: pass
+    log_sentence("GUI", who, "Machine OFF")
+
+# ---------------- GUI ----------------
+class SentinelGUI:
+    def __init__(self, root, stop_event: Event):
+        self.root = root
+        self.stop_event = stop_event
+        self.fullscreen = True
+
+        root.title("🛡 Sentinel Smart Lock")
+        root.configure(bg="#071428")
+        root.attributes("-fullscreen", True)
+        root.focus_force()
+        root.bind("<Escape>", self.toggle_fullscreen)
+
+        # top header
+        self.header = tk.Label(root, text="🛡 Sentinel Smart Lock",
+                               font=("Helvetica", 34, "bold"), bg="#071428", fg="#7BE0E0")
+        self.header.pack(pady=(12, 6))
+
+        # time label
+        self.time_label = tk.Label(root, text="", font=("Helvetica", 16),
+                                   bg="#071428", fg="#CFEFF0")
+        self.time_label.pack()
+
+        # main content frame
+        content = tk.Frame(root, bg="#071428")
+        content.pack(pady=(8, 8), fill="both", expand=True)
+
+        # camera pane
+        cam_panel = tk.Frame(content, bg="#07202A", bd=6, relief="ridge")
+        cam_panel.pack(side="left", padx=(20, 12), pady=10)
+        self.camera_label = tk.Label(cam_panel)
+        self.camera_label.pack()
+
+        # status & control pane
+        right_panel = tk.Frame(content, bg="#071428")
+        right_panel.pack(side="left", padx=(12, 20), pady=10, fill="y", expand=True)
+
+        # status labels
+        self.status_frame = tk.Frame(right_panel, bg="#071428")
+        self.status_frame.pack(pady=(6, 6), fill="x")
+
+        self.rfid_label = tk.Label(self.status_frame, text="RFID Detected : None",
+                                   font=("Helvetica", 18), bg="#071428", fg="#A3FFD9")
+        self.rfid_label.pack(pady=4, anchor="w")
+        self.face_label = tk.Label(self.status_frame, text="Face Detected : None",
+                                   font=("Helvetica", 18), bg="#071428", fg="#A3FFD9")
+        self.face_label.pack(pady=4, anchor="w")
+        self.lock_label = tk.Label(self.status_frame, text="Lock Status   : Closed",
+                                   font=("Helvetica", 18), bg="#071428", fg="#FFD27A")
+        self.lock_label.pack(pady=4, anchor="w")
+
+        # Machine control panel (hidden initially)
+        self.control_frame = tk.Frame(right_panel, bg="#063A44", bd=4, relief="groove")
+        # not packed yet - we pack when needed
+
+        self.ctrl_label = tk.Label(self.control_frame, text="Machine Control Panel",
+                                   font=("Helvetica", 20, "bold"), bg="#063A44", fg="white")
+        self.ctrl_label.pack(pady=8)
+
+        # machine on/off buttons
+        btn_frame = tk.Frame(self.control_frame, bg="#063A44")
+        btn_frame.pack(pady=(8, 6))
+
+        self.on_btn = tk.Button(btn_frame, text="MACHINE ON", font=("Helvetica", 16, "bold"),
+                                bg="#1CBF4A", fg="white", padx=10, pady=8,
+                                command=self.handle_machine_on)
+        self.on_btn.pack(side="left", padx=8)
+
+        self.off_btn = tk.Button(btn_frame, text="MACHINE OFF", font=("Helvetica", 16, "bold"),
+                                 bg="#D12D2D", fg="white", padx=10, pady=8,
+                                 command=self.handle_machine_off)
+        self.off_btn.pack(side="left", padx=8)
+
+        # close button triggers re-authentication flow
+        self.close_btn = tk.Button(self.control_frame, text="CLOSE (Require Re-auth)", font=("Helvetica", 14, "bold"),
+                                   bg="#888888", fg="white", padx=10, pady=8,
+                                   command=self.request_close_auth)
+        self.close_btn.pack(pady=(12, 10))
+
+        # add user and footer
+        self.add_btn = tk.Button(root, text="➕ ADD USER", font=("Helvetica", 18, "bold"),
+                                 bg="#13A88E", fg="white", padx=30, pady=10,
+                                 command=self.on_add_user)
+        self.add_btn.pack(pady=(10, 12))
+
+        self.footer = tk.Label(root, text="Developed by Vadeendra Karanam [CSE-IoT 2026 Batch]",
+                               font=("Helvetica", 12), bg="#071428", fg="#9FB9BE")
+        self.footer.pack(side="bottom", pady=6)
+
+        # start GUI update loops
+        self.update_clock()
+        self.update_frame()
+        self.update_status()
+
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def toggle_fullscreen(self, event=None):
+        self.fullscreen = not self.fullscreen
+        self.root.attributes("-fullscreen", self.fullscreen)
+        if not self.fullscreen:
+            self.root.geometry("1000x640+100+100")
+
+    def update_clock(self):
+        self.time_label.config(text=datetime.datetime.now().strftime("%Y-%m-%d %I:%M:%S %p"))
+        if not self.stop_event.is_set():
+            self.root.after(1000, self.update_clock)
 
     def update_frame(self):
-        ret, frame = self.cap.read()
-        if ret:
-            frame = self.process_frame(frame)
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame = cv2.rotate(frame, cv2.ROTATE_180)  # rotate if display upside down
-            img = Image.fromarray(frame)
-            imgtk = ImageTk.PhotoImage(image=img)
-            self.video_label.imgtk = imgtk
-            self.video_label.config(image=imgtk)
-        self.window.after(20, self.update_frame)
+        with frame_mutex:
+            local = None if frame is None else frame.copy()
+        if local is not None:
+            try:
+                img = Image.fromarray(local).resize((480, 360))
+                imgtk = ImageTk.PhotoImage(image=img)
+                self.camera_label.imgtk = imgtk
+                self.camera_label.configure(image=imgtk)
+            except Exception:
+                traceback.print_exc()
+        if not self.stop_event.is_set():
+            self.root.after(30, self.update_frame)
 
-    def new_registration(self):
-        print("👉 New Registration pressed")
-        # later -> os.system("python3 register.py")
+    def update_status(self):
+        now = time.time()
+        if now - active_rfid["last_seen"] > GUI_DETECT_TIMEOUT:
+            active_rfid["text"] = "None"
+        if now - active_face["last_seen"] > GUI_DETECT_TIMEOUT:
+            active_face["text"] = "None"
 
-    def on_closing(self):
-        self.cap.release()
-        cv2.destroyAllWindows()
-        GPIO.cleanup()
-        self.window.destroy()
+        self.rfid_label.config(text=f"RFID Detected : {active_rfid['text']}")
+        self.face_label.config(text=f"Face Detected : {active_face['text']}")
+        lock_text = f"Lock Status   : {'Opened by ' + current_user if lock_open else 'Closed'}"
+        self.lock_label.config(text=lock_text)
 
+        # If panel is open, keep it; if not, ensure hidden
+        with panel_mutex:
+            if panel_user is not None:
+                # ensure panel packed
+                if not self.control_frame.winfo_ismapped():
+                    self.control_frame.pack(pady=12, fill="x", padx=6)
+            else:
+                if self.control_frame.winfo_ismapped():
+                    self.control_frame.pack_forget()
+
+            # if expecting_close is active, show countdown in label
+            if expecting_close:
+                remaining = int(max(0, expect_close_deadline - time.time()))
+                self.ctrl_label.config(text=f"Confirm CLOSE: present ID now ({remaining}s)")
+                # visually disable machine buttons during close auth
+                self.on_btn.config(state="disabled")
+                self.off_btn.config(state="disabled")
+            else:
+                if panel_user:
+                    self.ctrl_label.config(text=f"Machine Control — {panel_user}")
+                else:
+                    self.ctrl_label.config(text="Machine Control Panel")
+                self.on_btn.config(state="normal")
+                self.off_btn.config(state="normal")
+
+        if not self.stop_event.is_set():
+            self.root.after(300, self.update_status)
+
+    def show_control_panel(self, user_identifier):
+        """
+        Called by detection handlers to show panel. Only shows if no-one else is using it.
+        """
+        global panel_user
+        with panel_mutex:
+            if panel_user is not None:
+                return
+            panel_user = user_identifier
+            print(f"[GUI] Panel opened for {panel_user}")
+            log_sentence("GUI", panel_user, "Opened Control Panel")
+
+    def hide_control_panel_authenticated(self, action_by=None):
+        """
+        Called when close-auth succeeds (action_by should match panel_user).
+        """
+        global panel_user, expecting_close, expect_close_deadline
+        with panel_mutex:
+            if panel_user is None:
+                return
+            if action_by != panel_user:
+                print(f"[GUI] Close auth rejected: {action_by} != {panel_user}")
+                return
+            # hide
+            self.control_frame.pack_forget()
+            log_sentence("GUI", panel_user, "Control Panel Closed (auth confirmed)")
+            print(f"[GUI] Panel closed by {action_by}")
+            panel_user = None
+            expecting_close = False
+            expect_close_deadline = 0.0
+
+    def request_close_auth(self):
+        """
+        Called when Close button is pressed. This starts a short window for the same user to re-present.
+        """
+        global expecting_close, expect_close_deadline
+        with panel_mutex:
+            if panel_user is None:
+                return
+            # start expecting close flow for 10 seconds
+            expecting_close = True
+            expect_close_deadline = time.time() + 10.0
+            print(f"[GUI] Close requested for {panel_user}. Awaiting re-auth for 10s.")
+            log_sentence("GUI", panel_user, "Requested Control Panel Close (awaiting re-auth)")
+        # spawn a watcher thread to clear the expecting_close flag after deadline
+        Thread(target=self._close_auth_watcher, daemon=True).start()
+
+    def _close_auth_watcher(self):
+        global expecting_close, expect_close_deadline
+        while True:
+            time.sleep(0.2)
+            with panel_mutex:
+                if not expecting_close:
+                    return
+                if time.time() > expect_close_deadline:
+                    # timeout
+                    expecting_close = False
+                    expect_close_deadline = 0.0
+                    print("[GUI] Close auth timed out.")
+                    log_sentence("GUI", panel_user or "None", "Control Panel Close Auth Timed Out")
+                    return
+
+    def handle_machine_on(self):
+        # Only allow if panel_user (owner) present
+        with panel_mutex:
+            if panel_user is None:
+                print("[GUI] No authorized user for machine on.")
+                return
+            machine_on(panel_user)
+
+    def handle_machine_off(self):
+        with panel_mutex:
+            if panel_user is None:
+                print("[GUI] No authorized user for machine off.")
+                return
+            machine_off(panel_user)
+
+    def on_add_user(self):
+        # launch add user script (existing flow)
+        self.stop_event.set()
+        if camera_cap: camera_cap.release()
+        if GPIO:
+            try: GPIO.output(RELAY_GPIO, GPIO.LOW)
+            except Exception: pass
+        self.root.destroy()
+        # adjust path as needed
+        subprocess.Popen([sys.executable, "/home/project/Desktop/Att/add.py"])
+        os._exit(0)
+
+    def on_close(self):
+        self.stop_event.set()
+        save_cooldown()
+        if camera_cap: camera_cap.release()
+        if GPIO:
+            try: GPIO.output(RELAY_GPIO, GPIO.LOW)
+            except Exception: pass
+        self.root.destroy()
+        os._exit(0)
+
+# ---------------- START ----------------
+def start_all():
+    global gui_instance
+    stop_event = Event()
+    Thread(target=camera_init_and_stream, args=(stop_event,), daemon=True).start()
+    Thread(target=face_thread_loop, args=(stop_event,), daemon=True).start()
+    if reader:
+        Thread(target=rfid_thread_loop, args=(stop_event,), daemon=True).start()
+    root = tk.Tk()
+    gui_instance = SentinelGUI(root, stop_event)
+    root.mainloop()
+    stop_event.set()
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = FaceRFIDSystem(root)
-    root.mainloop()
+    start_all()
