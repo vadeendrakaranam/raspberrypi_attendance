@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # sentinel_smart_lock_motor.py
 # Full integrated GUI + RFID + Face detection + Motor (GPIO17) control (Option A: RFID OR Face enables motor GUI)
-# Updated: continuous Machine ON/OFF status display and motor GUI green when detected, black when not
+# Updated: continuous Machine ON/OFF status display, motor GUI green when detected, black when not
+# Buttons text always white when enabled
 
 import sys
 import os
@@ -38,7 +39,7 @@ except Exception:
 LOG_FILE = "Logs.csv"
 COOLDOWN_FILE = "cooldown.json"   # kept for compatibility (not used for motor)
 MASTER_TAG = "769839607204"
-MASTER_NAME = "Universal"
+MASTER_NAME = "Admin"
 MOTOR_GPIO = 17            # BCM pin (physical 11)
 GUI_DETECT_TIMEOUT = 1.0
 CAM_TRY_INDICES = list(range(0, 5))
@@ -311,14 +312,14 @@ class SentinelGUI:
         self.root = root
         self.stop_event = stop_event
 
-        root.title("Sentinel Smart Lock - Motor Control (GPIO17)")
+        root.title("Sentinel MachineOps Hub")
         root.configure(bg="#071428")
         root.attributes("-fullscreen", True)
         root.focus_force()
         root.bind("<Escape>", self.toggle_fullscreen)
 
         # Header + time
-        self.header = tk.Label(root, text="🛡 Sentinel Smart Lock",
+        self.header = tk.Label(root, text="🛡 Sentinel Machine Access",
                                font=("Helvetica", 32, "bold"), bg="#071428", fg="#7BE0E0")
         self.header.pack(pady=(12,6))
 
@@ -420,27 +421,27 @@ class SentinelGUI:
             user = current_user
 
         if user is not None:
-            # enable controls and set motor frame to green
-            self.btn_on.config(state="normal")
-            self.btn_off.config(state="normal")
+            # enable controls and set motor frame to green, button text white
+            self.btn_on.config(state="normal", fg="white")
+            self.btn_off.config(state="normal", fg="white")
             self.motor_frame.config(bg="#13A88E")
-            self.motor_title.config(bg="#13A88E")
+            self.motor_title.config(bg="#13A88E", fg="white")
             self.motor_row.config(bg="#13A88E")
             for w in self.motor_frame.winfo_children():
                 try:
-                    w.config(bg="#13A88E")
+                    w.config(bg="#13A88E", fg="white")
                 except Exception:
                     pass
         else:
-            # black when no detection
-            self.btn_on.config(state="disabled")
-            self.btn_off.config(state="disabled")
+            # black when no detection, buttons disabled, text white
+            self.btn_on.config(state="disabled", fg="white")
+            self.btn_off.config(state="disabled", fg="white")
             self.motor_frame.config(bg="black")
-            self.motor_title.config(bg="black")
+            self.motor_title.config(bg="black", fg="white")
             self.motor_row.config(bg="black")
             for w in self.motor_frame.winfo_children():
                 try:
-                    w.config(bg="black")
+                    w.config(bg="black", fg="white")
                 except Exception:
                     pass
 
