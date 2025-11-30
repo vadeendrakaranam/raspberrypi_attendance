@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # sentinel_smart_lock_motor.py
 # Full integrated GUI + RFID + Face detection + Motor (GPIO17) control (Option A: RFID OR Face enables motor GUI)
-# Updated: continuous Machine ON/OFF status display and motor GUI black when not detected
+# Updated: continuous Machine ON/OFF status display and motor GUI green when detected, black when not
 
 import sys
 import os
@@ -62,7 +62,7 @@ machine_state = "OFF"           # "ON" or "OFF"
 last_machine_user = None        # string identifier for last access
 last_machine_method = None      # "RFID" or "FACE"
 
-# ---------------- Email / Unknown Image Setup (unchanged) ----------------
+# ---------------- Email / Unknown Image Setup ----------------
 import smtplib
 from email.message import EmailMessage
 import ssl
@@ -156,7 +156,6 @@ def handle_rfid_detection(tag_id):
     tag_str = str(tag_id)
     now = time.time()
 
-    # master tag sets authentication for MASTER_NAME
     if tag_str == MASTER_TAG:
         with det_mutex:
             current_user = MASTER_NAME
@@ -165,7 +164,6 @@ def handle_rfid_detection(tag_id):
             active_rfid["last_seen"] = now
         return
 
-    # check DB for name
     try:
         conn = sqlite3.connect("rfid_data.db")
         cur = conn.cursor()
@@ -186,13 +184,12 @@ def handle_rfid_detection(tag_id):
         return
 
     name = res[0]
-    ident = f"{name}"
     with det_mutex:
-        current_user = ident
+        current_user = name
         auth_method = "RFID"
-    active_rfid["text"] = ident
+    active_rfid["text"] = name
     active_rfid["last_seen"] = now
-    print(f"[RFID] Known user detected: {ident}")
+    print(f"[RFID] Known user detected: {name}")
 
 def rfid_thread_loop(stop_event: Event):
     if reader is None:
@@ -328,7 +325,6 @@ class SentinelGUI:
         self.time_label = tk.Label(root, text="", font=("Helvetica", 16), bg="#071428", fg="#CFEFF0")
         self.time_label.pack()
 
-        # main layout: camera left, status & controls right
         main = tk.Frame(root, bg="#071428")
         main.pack(expand=True, fill="both", padx=12, pady=10)
 
@@ -342,34 +338,31 @@ class SentinelGUI:
         right = tk.Frame(main, bg="#071428")
         right.pack(side="left", fill="y", padx=(12,24))
 
-        # status
         self.rfid_label = tk.Label(right, text="RFID Detected : None", font=("Helvetica", 18), bg="#071428", fg="#A3FFD9")
         self.rfid_label.pack(anchor="w", pady=4)
         self.face_label = tk.Label(right, text="Face Detected : None", font=("Helvetica", 18), bg="#071428", fg="#A3FFD9")
         self.face_label.pack(anchor="w", pady=4)
 
-        # Status text (shows Machine ON/OFF continuously)
         self.status_label = tk.Label(right, text="Status : Waiting", font=("Helvetica", 16), bg="#071428", fg="#FFD27A")
         self.status_label.pack(anchor="w", pady=(10,8))
 
-        # Motor GUI - always visible but black when not detected
+        # Motor GUI
         self.motor_frame = tk.Frame(right, bg="black", bd=4, relief="ridge")
         self.motor_frame.pack(pady=8, fill="x")
         self.motor_title = tk.Label(self.motor_frame, text="Machine Control (GPIO17)", font=("Helvetica", 16, "bold"), bg="black", fg="#FFCF7A")
         self.motor_title.pack(pady=(8,6))
 
-        row = tk.Frame(self.motor_frame, bg="black")
-        row.pack(pady=(6,12))
-        self.btn_on = tk.Button(row, text="MACHINE ON", font=("Helvetica", 14, "bold"), bg="#1CBF4A", fg="white", padx=18, pady=8, state="disabled", command=self.machine_on)
+        self.motor_row = tk.Frame(self.motor_frame, bg="black")
+        self.motor_row.pack(pady=(6,12))
+        self.btn_on = tk.Button(self.motor_row, text="MACHINE ON", font=("Helvetica", 14, "bold"), bg="#1CBF4A", fg="white", padx=18, pady=8, state="disabled", command=self.machine_on)
         self.btn_on.pack(side="left", padx=8)
-        self.btn_off = tk.Button(row, text="MACHINE OFF", font=("Helvetica", 14, "bold"), bg="#D12D2D", fg="white", padx=18, pady=8, state="disabled", command=self.machine_off)
+        self.btn_off = tk.Button(self.motor_row, text="MACHINE OFF", font=("Helvetica", 14, "bold"), bg="#D12D2D", fg="white", padx=18, pady=8, state="disabled", command=self.machine_off)
         self.btn_off.pack(side="left", padx=8)
 
         # Add user button
         self.add_btn = tk.Button(right, text="➕ ADD USER", font=("Helvetica", 16, "bold"), bg="#13A88E", fg="white", padx=20, pady=10, command=self.on_add_user)
         self.add_btn.pack(pady=(18,6), fill="x")
 
-        # footer
         self.footer = tk.Label(root, text="Developed by Vadeendra Karanam [CSE-IoT 2026 Batch]", font=("Helvetica", 12), bg="#071428", fg="#9FB9BE")
         self.footer.pack(side="bottom", pady=6)
 
@@ -377,7 +370,6 @@ class SentinelGUI:
         self.update_clock()
         self.update_frame()
         self.update_status_loop()
-
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def toggle_fullscreen(self, event=None):
@@ -413,7 +405,6 @@ class SentinelGUI:
         self.rfid_label.config(text=f"RFID Detected : {active_rfid['text']}")
         self.face_label.config(text=f"Face Detected : {active_face['text']}")
 
-        # Show continuous machine status
         with machine_mutex:
             ms = machine_state
             lm_user = last_machine_user
@@ -427,26 +418,26 @@ class SentinelGUI:
         # Motor GUI coloring and button enable/disable
         with det_mutex:
             user = current_user
-            method = auth_method
 
         if user is not None:
-            # enable controls and set motor frame to visible color
+            # enable controls and set motor frame to green
             self.btn_on.config(state="normal")
             self.btn_off.config(state="normal")
-            self.motor_frame.config(bg="#0F1B20")
-            self.motor_title.config(bg="#0F1B20")
-            # also ensure row and button parents background changed
+            self.motor_frame.config(bg="#13A88E")
+            self.motor_title.config(bg="#13A88E")
+            self.motor_row.config(bg="#13A88E")
             for w in self.motor_frame.winfo_children():
                 try:
-                    w.config(bg="#0F1B20")
+                    w.config(bg="#13A88E")
                 except Exception:
                     pass
         else:
-            # completely black when no detection
+            # black when no detection
             self.btn_on.config(state="disabled")
             self.btn_off.config(state="disabled")
             self.motor_frame.config(bg="black")
             self.motor_title.config(bg="black")
+            self.motor_row.config(bg="black")
             for w in self.motor_frame.winfo_children():
                 try:
                     w.config(bg="black")
@@ -467,7 +458,6 @@ class SentinelGUI:
             self.status_label.config(text="Status : No authenticated user")
             return
 
-        # Toggle GPIO (BCM 17)
         if GPIO:
             try:
                 GPIO.output(MOTOR_GPIO, GPIO.HIGH)
@@ -482,11 +472,9 @@ class SentinelGUI:
         log_machine_access("ON", user, method)
         self.status_label.config(text=f"Machine accessed by {user} - {method} (ON)")
 
-        # deactivate access until next detection
         with det_mutex:
             current_user = None
             auth_method = None
-        # buttons will be disabled by update loop
 
     def machine_off(self):
         global current_user, auth_method, machine_state, last_machine_user, last_machine_method
@@ -517,15 +505,9 @@ class SentinelGUI:
             auth_method = None
 
     def on_add_user(self):
-        # Launch existing add.py (preserve behavior)
         self.stop_event.set()
         if camera_cap:
             camera_cap.release()
-        try:
-            # do not manipulate GPIO here
-            pass
-        except Exception:
-            pass
         self.root.destroy()
         subprocess.Popen([sys.executable, "/home/project/Desktop/Att/add.py"])
         os._exit(0)
@@ -549,7 +531,6 @@ def start_all():
     Thread(target=face_thread_loop, args=(stop_event,), daemon=True).start()
     if reader:
         Thread(target=rfid_thread_loop, args=(stop_event,), daemon=True).start()
-    # else: RFID not available — face-only or simulation possible
 
     root = tk.Tk()
     SentinelGUI(root, stop_event)
